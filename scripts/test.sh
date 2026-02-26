@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./scripts/test.sh fast     # Unit + lib tests only (< 30s)
+#   ./scripts/test.sh gates    # Conformance regression gate (< 15s)
 #   ./scripts/test.sh full     # All tests including conformance + differential (< 5 min)
 #   ./scripts/test.sh          # Default: full
 
@@ -14,6 +15,12 @@ case "$MODE" in
   fast)
     echo "=== Fast: unit + lib tests ==="
     cargo test --lib
+    ;;
+
+  gates)
+    echo "=== Gates: conformance regression check ==="
+    cargo test -p blc --test conformance_tests -- --nocapture
+    echo "=== PASS ==="
     ;;
 
   full)

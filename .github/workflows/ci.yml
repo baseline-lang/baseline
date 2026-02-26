@@ -34,6 +34,19 @@ jobs:
       - run: cargo test -p blc
       - run: cargo test -p blc --features mcp --test mcp_tests
 
+  conformance:
+    name: Conformance (JIT)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run conformance tests
+        run: cargo test -p blc --test conformance_tests -- --nocapture 2>&1 | tee /tmp/conformance.log
+      - name: Report counts
+        if: always()
+        run: grep -E "(Conformance|Negative)" /tmp/conformance.log || true
+
   grammar:
     name: Grammar Up-to-date
     runs-on: ubuntu-latest

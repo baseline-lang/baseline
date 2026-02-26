@@ -164,7 +164,17 @@ fn conformance_positive_tests() {
     }
 
     assert!(passed > 0, "No conformance tests found!");
-    eprintln!("Conformance: {passed} files passed");
+
+    // Regression gate: fail if tests silently disappear.
+    // Update this number when you ADD new conformance tests.
+    const MIN_POSITIVE: usize = 141;
+    assert!(
+        passed >= MIN_POSITIVE,
+        "Conformance regression: expected at least {MIN_POSITIVE} positive tests, but only {passed} passed. \
+         If tests were intentionally removed, update MIN_POSITIVE in conformance_tests.rs."
+    );
+
+    eprintln!("Conformance: {passed} positive tests passed (minimum: {MIN_POSITIVE})");
 }
 
 #[test]
@@ -211,5 +221,15 @@ fn conformance_negative_tests() {
     }
 
     assert!(passed > 0, "No negative tests found!");
-    eprintln!("Negative tests: {passed} files passed");
+
+    // Regression gate: fail if negative tests silently disappear.
+    // Update this number when you ADD new negative test files.
+    const MIN_NEGATIVE: usize = 26;
+    assert!(
+        passed >= MIN_NEGATIVE,
+        "Negative test regression: expected at least {MIN_NEGATIVE} negative tests, but only {passed} passed. \
+         If tests were intentionally removed, update MIN_NEGATIVE in conformance_tests.rs."
+    );
+
+    eprintln!("Negative tests: {passed} files passed (minimum: {MIN_NEGATIVE})");
 }
