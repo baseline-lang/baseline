@@ -22,7 +22,7 @@ pub fn run_test_file_jit(path: &Path) -> TestSuiteResult {
     let tree = parser.parse(&source, None).unwrap();
     let root = tree.root_node();
 
-    let check_result = crate::parse::parse_source(&source, &file_str);
+    let check_result = crate::parse::parse_source_with_path(&source, path);
     if check_result.diagnostics.iter().any(|d| d.severity == crate::diagnostics::Severity::Error) {
         return empty_fail_result_msg("Analysis failed");
     }
@@ -62,7 +62,7 @@ pub fn run_test_file_jit(path: &Path) -> TestSuiteResult {
     let mut execute_module = ir_test_module.into_executable_module();
     crate::vm::optimize_ir::optimize(&mut execute_module);
 
-    let program = match crate::vm::jit::compile_with_natives(&execute_module, true, Some(&natives)) {
+    let program = match crate::vm::jit::compile_with_natives(&execute_module, false, Some(&natives)) {
         Ok(p) => p,
         Err(e) => return empty_fail_result_msg(&format!("JIT compile error: {}", e)),
     };
@@ -95,7 +95,7 @@ pub fn run_test_file_aot(path: &Path) -> TestSuiteResult {
     let tree = parser.parse(&source, None).unwrap();
     let root = tree.root_node();
 
-    let check_result = crate::parse::parse_source(&source, &file_str);
+    let check_result = crate::parse::parse_source_with_path(&source, path);
     if check_result.diagnostics.iter().any(|d| d.severity == crate::diagnostics::Severity::Error) {
         return empty_fail_result_msg("Analysis failed");
     }
