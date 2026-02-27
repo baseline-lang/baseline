@@ -733,6 +733,24 @@ pub(super) fn builtin_type_signatures(prelude: &Prelude) -> HashMap<String, Type
             "List.concat".into(),
             Type::Function(vec![Type::Unknown, Type::Unknown], Box::new(Type::Unknown)),
         );
+        sigs.insert(
+            "List.set".into(),
+            Type::Function(
+                vec![Type::Unknown, Type::Int, Type::Unknown],
+                Box::new(Type::Unknown),
+            ),
+        );
+        sigs.insert(
+            "List.slice".into(),
+            Type::Function(
+                vec![Type::Unknown, Type::Int, Type::Int],
+                Box::new(Type::Unknown),
+            ),
+        );
+        sigs.insert(
+            "List.fill".into(),
+            Type::Function(vec![Type::Int, Type::Unknown], Box::new(Type::Unknown)),
+        );
     }
 
     // -- HttpError constructors (pure) — return HttpError enum --

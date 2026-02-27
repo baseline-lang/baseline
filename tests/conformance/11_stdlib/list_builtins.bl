@@ -25,3 +25,34 @@ test "sort" = {
   List.fold(sorted, "", |acc, x| "${acc}${x}") == "11345"
 }
 test "concat" = List.length(List.concat([1, 2], [3, 4, 5])) == 5
+
+test "set basic" = {
+  let xs = [10, 20, 30, 40, 50]
+  let ys = List.set(xs, 2, 99)
+  Option.unwrap(List.get(ys, 2)) == 99
+}
+test "set preserves other elements" = {
+  let xs = [10, 20, 30]
+  let ys = List.set(xs, 1, 99)
+  Option.unwrap(List.get(ys, 0)) == 10
+}
+test "set out of bounds" = {
+  let xs = [10, 20, 30]
+  List.length(List.set(xs, 5, 99)) == 3
+}
+test "slice basic" = {
+  let xs = [10, 20, 30, 40, 50]
+  let sl = List.slice(xs, 1, 4)
+  List.length(sl) == 3
+}
+test "slice first element" = {
+  let sl = List.slice([10, 20, 30, 40, 50], 1, 4)
+  Option.unwrap(List.get(sl, 0)) == 20
+}
+test "slice clamps bounds" = {
+  let xs = [10, 20, 30]
+  List.length(List.slice(xs, 0, 100)) == 3
+}
+test "fill basic" = List.length(List.fill(5, 0)) == 5
+test "fill value" = Option.unwrap(List.get(List.fill(3, 42), 1)) == 42
+test "fill empty" = List.length(List.fill(0, 1)) == 0

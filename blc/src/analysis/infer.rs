@@ -442,6 +442,51 @@ pub fn builtin_generic_schemas() -> HashMap<String, GenericSchema> {
         },
     );
 
+    // List.set : (List<A>, Int, A) -> List<A>
+    schemas.insert(
+        "List.set".into(),
+        GenericSchema {
+            type_params: 1,
+            build: |ctx| {
+                let a = ctx.fresh_var();
+                Type::Function(
+                    vec![Type::List(Box::new(a.clone())), Type::Int, a.clone()],
+                    Box::new(Type::List(Box::new(a))),
+                )
+            },
+        },
+    );
+
+    // List.slice : (List<A>, Int, Int) -> List<A>
+    schemas.insert(
+        "List.slice".into(),
+        GenericSchema {
+            type_params: 1,
+            build: |ctx| {
+                let a = ctx.fresh_var();
+                Type::Function(
+                    vec![Type::List(Box::new(a.clone())), Type::Int, Type::Int],
+                    Box::new(Type::List(Box::new(a))),
+                )
+            },
+        },
+    );
+
+    // List.fill : (Int, A) -> List<A>
+    schemas.insert(
+        "List.fill".into(),
+        GenericSchema {
+            type_params: 1,
+            build: |ctx| {
+                let a = ctx.fresh_var();
+                Type::Function(
+                    vec![Type::Int, a.clone()],
+                    Box::new(Type::List(Box::new(a))),
+                )
+            },
+        },
+    );
+
     // Option.unwrap : (Option<A>) -> A
     schemas.insert(
         "Option.unwrap".into(),

@@ -217,6 +217,104 @@ pub(super) fn native_list_get(args: &[NValue]) -> Result<NValue, NativeError> {
     }
 }
 
+pub(super) fn native_list_set(args: &[NValue]) -> Result<NValue, NativeError> {
+    match args[0].as_list() {
+        Some(items) => {
+            if !args[1].is_any_int() {
+                return Err(NativeError(format!(
+                    "List.set: expected Int index, got {}",
+                    args[1]
+                )));
+            }
+            let idx = args[1].as_any_int();
+            if idx < 0 || idx as usize >= items.len() {
+                return Ok(args[0].clone());
+            }
+            let mut new_items = items.clone();
+            new_items[idx as usize] = args[2].clone();
+            Ok(NValue::list(new_items))
+        }
+        None => Err(NativeError(format!(
+            "List.set: expected List, got {}",
+            args[0]
+        ))),
+    }
+}
+
+/// Owning CoW variant of List.set. Mutates in-place when uniquely owned.
+pub(super) fn native_list_set_owning(args: Vec<NValue>) -> Result<NValue, NativeError> {
+    let mut args = args;
+    let val = args.pop().unwrap();
+    let idx_val = args.pop().unwrap();
+    let list_val = args.pop().unwrap();
+
+    if !idx_val.is_any_int() {
+        return Err(NativeError(format!(
+            "List.set: expected Int index, got {}",
+            idx_val
+        )));
+    }
+    let idx = idx_val.as_any_int();
+
+    match list_val.try_unwrap_heap() {
+        Ok(HeapObject::List(mut vec)) => {
+            if idx < 0 || idx as usize >= vec.len() {
+                return Ok(NValue::list(vec));
+            }
+            vec[idx as usize] = val;
+            Ok(NValue::list(vec))
+        }
+        Ok(_) => Err(NativeError("List.set: expected List".into())),
+        Err(list_val) => match list_val.as_list() {
+            Some(items) => {
+                if idx < 0 || idx as usize >= items.len() {
+                    return Ok(list_val);
+                }
+                let mut new_items = items.clone();
+                new_items[idx as usize] = val;
+                Ok(NValue::list(new_items))
+            }
+            None => Err(NativeError(format!(
+                "List.set: expected List, got {}",
+                list_val
+            ))),
+        },
+    }
+}
+
+pub(super) fn native_list_slice(args: &[NValue]) -> Result<NValue, NativeError> {
+    match args[0].as_list() {
+        Some(items) => {
+            if !args[1].is_any_int() || !args[2].is_any_int() {
+                return Err(NativeError(
+                    "List.slice: expected (List, Int, Int)".into(),
+                ));
+            }
+            let start = args[1].as_any_int().max(0) as usize;
+            let end = args[2].as_any_int().max(0) as usize;
+            let start = start.min(items.len());
+            let end = end.min(items.len()).max(start);
+            Ok(NValue::list(items[start..end].to_vec()))
+        }
+        None => Err(NativeError(format!(
+            "List.slice: expected List, got {}",
+            args[0]
+        ))),
+    }
+}
+
+pub(super) fn native_list_fill(args: &[NValue]) -> Result<NValue, NativeError> {
+    if !args[0].is_any_int() {
+        return Err(NativeError(format!(
+            "List.fill: expected Int size, got {}",
+            args[0]
+        )));
+    }
+    let size = args[0].as_any_int().max(0) as usize;
+    let val = args[1].clone();
+    Ok(NValue::list(vec![val; size]))
+}
+
 /// Polymorphic contains for test matchers: string -> substring check, list -> element check.
 pub(super) fn native_test_contains(args: &[NValue]) -> Result<NValue, NativeError> {
     if let Some(s) = args[0].as_string() {

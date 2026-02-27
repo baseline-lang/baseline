@@ -372,6 +372,9 @@ impl NativeRegistry {
         self.register_owning("List.concat", native_list_concat, native_list_concat_owning);
         self.register("List.contains", native_list_contains);
         self.register("List.get", native_list_get);
+        self.register_owning("List.set", native_list_set, native_list_set_owning);
+        self.register("List.slice", native_list_slice);
+        self.register("List.fill", native_list_fill);
 
         // -- Option --
         self.register("Option.unwrap", native_option_unwrap);
