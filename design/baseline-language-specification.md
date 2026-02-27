@@ -1,6 +1,6 @@
 # Baseline Language Specification
 
-**Version 0.2.0 — Draft**
+**Version 0.1.0 — Beta**
 
 > A fast, verifiable, dual-audience programming language: native to both LLMs and humans.
 
@@ -8,17 +8,41 @@
 
 ---
 
-### Implementation Status Key
+### Beta Scope
 
-This specification describes the full Baseline v0.2 target language. Each feature is marked with its current implementation status in the `blc` compiler:
+This specification describes both implemented features and planned v0.2 targets. The **beta** includes all features marked `[IMPLEMENTED]` and `[PARTIAL]` below. Features marked `[PLANNED]` are normative design for future releases — they describe how the language *will* work but are **not available in the beta**.
+
+**What works in beta:**
+- Core types: Int, Float, String, Boolean, List, Option, Result, records, enums, tuples
+- Functions with type-checked parameters, return types, and generic inference for builtins
+- Pattern matching with constructors, literals, wildcards, and variable binding
+- Algebraic effect declarations, checking, and inference (including ambient effects, restrict blocks, and @pure)
+- Module system with imports, transitive resolution, and cycle detection
+- Refinement types with integer interval constraints and SMT verification
+- BDD-style testing framework (describe/it/test/expect)
+- Pipe operator (`|>`)
+- Standard library: 30+ modules, 300+ native functions
+- Cranelift JIT runtime with tail-call optimization and native code execution
+- Language server (diagnostics, hover, go-to-definition, completion)
+- Code formatter (`blc fmt`) and documentation generator (`blc docs`)
+
+**Not yet available (planned for v0.2):**
+- Algebraic effect *handlers* (`handle...with` — declarations and checking work, runtime handlers do not)
+- User-defined generic functions (builtin generic inference works)
+- Row polymorphism, Char type, Never type
+- List/record destructuring patterns, match guards, or-patterns
+- Concurrency/fibers, REPL
+- Constrained Generation Protocol (CGP), LLM Bootstrap Kit
+
+### Implementation Status Key
 
 - **[IMPLEMENTED]** — Working in grammar, type checker, and JIT runtime
 - **[PARTIAL]** — Partially implemented (e.g., grammar exists but no type checking, or type-checks but no JIT runtime)
 - **[PLANNED]** — Designed but not yet implemented; target for v0.2
 
-Features marked `[PLANNED]` are normative design — they describe how the language *will* work and should be implemented to match this specification. The compiler is in bootstrap phase; see conformance tests in `tests/conformance/` for verified behavior.
+See conformance tests in `tests/conformance/` for verified behavior.
 
-> **Note (v0.15):** The bytecode VM and tree-walk interpreter have been removed. The Cranelift JIT is now the sole execution backend. Features that relied on the old interpreter (algebraic effect handlers with `handle...with`, concurrency/fibers, REPL) are not yet supported in the JIT path.
+> **Note:** The Cranelift JIT is the sole execution backend. Features that relied on the old interpreter (algebraic effect handlers with `handle...with`, concurrency/fibers, REPL) are not yet supported in the JIT path.
 
 ---
 
@@ -1331,7 +1355,9 @@ fn bad(x: Int) -> Int =
 
 Low-risk observability effects are **ambient**: they are allowed without explicit declaration, even in functions with explicit effect annotations. This prevents the "logging tax" where every function in a realistic codebase would need `{Log}` in its signature.
 
-Ambient effects: `Log`, `Time`, `Random`.
+Ambient effects: `Log`, `Time`.
+
+> **Note:** `Random` is *not* ambient because it affects determinism and testability. Functions using `Random` must declare `{Random}` in their effect signature.
 
 ```baseline
 // Log is ambient — no need to declare {Log} alongside {Http}
