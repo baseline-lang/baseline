@@ -1,0 +1,175 @@
+// Conformance: JIT effect evidence passing
+//
+// Verifies tail-resumptive handlers compile correctly through the evidence
+// transform and execute via JIT (Cranelift). Covers nested handlers,
+// transitive evidence, recursion, closures, and state mock patterns.
+
+// --- Nested handlers ---
+
+// Inner and outer handlers for same effect
+test "nested handlers same effect" = handle {
+  handle {
+    Console.println!("inner")
+    10
+  } with {
+    Console.println!(msg, resume) -> resume(())
+  }
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 10
+
+// Inner handler shadows outer for same effect
+test "inner handler shadows outer" = handle {
+  let outer_val = handle {
+    Console.println!("caught by inner")
+    42
+  } with {
+    Console.println!(msg, resume) -> resume(())
+  }
+  outer_val
+} with {
+  Console.println!(msg) -> -1
+} == 42
+
+// Nested handlers with body computation between layers
+test "nested with computation" = handle {
+  let x = handle {
+    Console.println!("a")
+    10
+  } with {
+    Console.println!(msg, resume) -> resume(())
+  }
+  let y = handle {
+    Console.println!("b")
+    20
+  } with {
+    Console.println!(msg, resume) -> resume(())
+  }
+  x + y
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 30
+
+// --- Effects across function boundaries ---
+
+// Function that performs an effect, called from handler scope
+// (no explicit effect annotation — effects inferred)
+fn greet_helper() -> Int = {
+  Console.println!("hello from greet")
+  99
+}
+
+test "effect in called function" = handle {
+  greet_helper()
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 99
+
+// Chain of function calls with effects
+fn step_a() -> Int = {
+  Console.println!("step a")
+  1
+}
+
+fn step_b() -> Int = {
+  Console.println!("step b")
+  let a = step_a()
+  a + 2
+}
+
+test "transitive effect through call chain" = handle {
+  step_b()
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 3
+
+// --- Effects in recursive functions ---
+
+// Recursive function that performs effects
+fn count_down(n: Int) -> Int = {
+  if n <= 0 then
+    0
+  else {
+    Console.println!("tick")
+    let rest = count_down(n - 1)
+    rest + 1
+  }
+}
+
+test "recursive function with effects" = handle {
+  count_down(5)
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 5
+
+// Recursive with accumulator and effects
+fn sum_with_log(n: Int, acc: Int) -> Int = {
+  if n <= 0 then
+    acc
+  else {
+    Console.println!("adding")
+    sum_with_log(n - 1, acc + n)
+  }
+}
+
+test "recursive accumulator with effects" = handle {
+  sum_with_log(4, 0)
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 10
+
+// --- Effects with closures ---
+
+// Closure used inside handler scope
+test "closure in handler scope" = handle {
+  let double = |x| x * 2
+  let val = double(21)
+  Console.println!("result")
+  val
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 42
+
+// List operations inside handler scope
+test "list fold in handler scope" = handle {
+  Console.println!("start")
+  let nums = [1, 2, 3, 4]
+  List.fold(nums, 0, |acc, x| acc + x)
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 10
+
+// --- State mock pattern ---
+
+// Abort after first effect (simulates error on effect)
+test "abort after N effects" = handle {
+  Console.println!("one")
+  Console.println!("two")
+  Console.println!("three")
+  0
+} with {
+  Console.println!(msg) -> 1
+} == 1
+
+// Pure body with handler still returns body value
+test "handler with pure body returns value" = handle {
+  let x = 10
+  let y = 20
+  x * y
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 200
+
+// Sequential handle blocks — first feeds into second
+test "sequential handle blocks" = handle {
+  let a = handle {
+    Console.println!("first")
+    10
+  } with {
+    Console.println!(msg, resume) -> resume(())
+  }
+  Console.println!("between")
+  a + 20
+} with {
+  Console.println!(msg, resume) -> resume(())
+} == 30

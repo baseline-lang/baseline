@@ -1,0 +1,68 @@
+// check-only
+// Conformance: non-tail-resumptive effect handlers (fiber-based)
+// Requires fiber-based JIT support (BASEL-332) to execute.
+//
+// These handlers do work AFTER resume(), requiring fiber-based coroutines.
+// Tail-resumptive handlers (where the body is just `resume(expr)`) use
+// evidence passing instead.
+
+// Test 1: Non-tail-resumptive handler — work after resume
+// Handler does addition after resuming the body.
+test "work after resume" = handle {
+  Console.println!("hello")
+  10
+} with {
+  Console.println!(msg, resume) -> {
+    let r = resume(())
+    r + 5
+  }
+} == 15
+
+// Test 2: Abort handler — no resume call
+// Handler returns immediately without resuming the body.
+test "abort handler no resume" = handle {
+  Console.println!("hello")
+  42
+} with {
+  Console.println!(msg) -> -1
+} == -1
+
+// Test 3: Multiple performs in one body
+// Each perform yields to the handler, which resumes and adds to the result.
+test "multiple performs" = handle {
+  Console.println!("a")
+  Console.println!("b")
+  100
+} with {
+  Console.println!(msg, resume) -> {
+    let r = resume(())
+    r + 1
+  }
+} == 102
+
+// Test 4: Handler transforms resume value
+// The handler passes a different value to the continuation.
+test "handler transforms resume value" = handle {
+  let x = Console.println!("get value")
+  x + 10
+} with {
+  Console.println!(msg, resume) -> {
+    let r = resume(())
+    r
+  }
+} == 10
+
+// Test 5: Nested handlers — tail-resumptive inside non-tail-resumptive
+test "nested tail inside non-tail" = handle {
+  handle {
+    Console.println!("inner")
+    50
+  } with {
+    Console.println!(msg, resume) -> resume(())
+  }
+} with {
+  Console.println!(msg, resume) -> {
+    let r = resume(())
+    r + 7
+  }
+} == 50

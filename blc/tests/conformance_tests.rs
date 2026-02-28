@@ -83,16 +83,18 @@ fn is_negative_test(path: &Path) -> bool {
 }
 
 fn is_check_only(path: &Path) -> bool {
-    // Files with main! or in effects/modules dirs are check-pass only
+    // Files with `// check-only` marker are check-pass only (type checking, no execution)
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    if content.lines().any(|l| l.trim() == "// check-only") {
+        return true;
+    }
+    // Directories that are check-pass only by default
     let parent = path
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    parent == "08_effects"
-        || parent == "09_modules"
-        || parent == "13_concurrency"
-        || parent == "14_web"
+    parent == "09_modules" || parent == "13_concurrency" || parent == "14_web"
 }
 
 /// Extract expected error codes from comments like:
@@ -184,7 +186,7 @@ fn conformance_positive_tests() {
 
     // Regression gate: fail if tests silently disappear.
     // Update this number when you ADD new conformance tests.
-    const MIN_POSITIVE: usize = 142;
+    const MIN_POSITIVE: usize = 143;
     assert!(
         passed >= MIN_POSITIVE,
         "Conformance regression: expected at least {MIN_POSITIVE} positive tests, but only {passed} passed. \
