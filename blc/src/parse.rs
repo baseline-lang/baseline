@@ -12,7 +12,33 @@ use tree_sitter_baseline::LANGUAGE;
 use crate::diagnostics::{
     CheckResult, Diagnostic, Location, Severity, Suggestion, VerificationLevel,
 };
+use crate::manifest;
 use crate::resolver::ModuleLoader;
+
+/// Create a ModuleLoader with dependency paths from the nearest `baseline.toml`.
+fn loader_with_deps(base_dir: Option<&Path>) -> ModuleLoader {
+    let mut loader = match base_dir {
+        Some(dir) => ModuleLoader::with_base_dir(dir.to_path_buf()),
+        None => ModuleLoader::new(),
+    };
+
+    // Register dependency paths from baseline.toml
+    if let Some(dir) = base_dir {
+        if let Some((m, manifest_dir)) = manifest::load_manifest(dir) {
+            for (name, dep) in &m.dependencies {
+                let dep_dir = match dep {
+                    manifest::Dependency::Url { hash, .. } => {
+                        manifest_dir.join(".baseline").join("deps").join(hash)
+                    }
+                    manifest::Dependency::Path { path } => manifest_dir.join(path),
+                };
+                loader.add_dep_path(name.clone(), dep_dir);
+            }
+        }
+    }
+
+    loader
+}
 
 /// Parse a Baseline source file and return check results.
 pub fn parse_file(path: &Path) -> Result<CheckResult, std::io::Error> {
@@ -34,12 +60,8 @@ pub fn parse_file(path: &Path) -> Result<CheckResult, std::io::Error> {
 
     // Only run semantic analysis if there are no syntax errors
     if diagnostics.is_empty() {
-        // Create a ModuleLoader for cross-module import resolution
-        let base_dir = path.parent().map(|p| p.to_path_buf());
-        let mut loader = match base_dir {
-            Some(dir) => ModuleLoader::with_base_dir(dir),
-            None => ModuleLoader::new(),
-        };
+        let base_dir = path.parent();
+        let mut loader = loader_with_deps(base_dir);
 
         // Run type checking pass with import support
         let root_node = tree.root_node();
@@ -166,11 +188,8 @@ pub fn parse_source_with_path(source: &str, file_path: &Path) -> CheckResult {
     collect_errors(root, source, &file_name, &mut diagnostics);
 
     if diagnostics.is_empty() {
-        let base_dir = file_path.parent().map(|p| p.to_path_buf());
-        let mut loader = match base_dir {
-            Some(dir) => ModuleLoader::with_base_dir(dir),
-            None => ModuleLoader::new(),
-        };
+        let base_dir = file_path.parent();
+        let mut loader = loader_with_deps(base_dir);
 
         let root_node = tree.root_node();
         let type_diagnostics = crate::analysis::check_types_with_loader(

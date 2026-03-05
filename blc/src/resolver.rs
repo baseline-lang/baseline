@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Parser, Tree};
 use tree_sitter_baseline::LANGUAGE;
 
-use crate::diagnostics::{Diagnostic, Location, Severity};
+use crate::diagnostics::{Diagnostic, Location, Severity, Suggestion};
 
 /// Describes what an imported module exports: function names with their type signatures.
 #[derive(Debug, Clone)]
@@ -47,6 +47,9 @@ pub struct ModuleLoader {
     /// Cache: canonical path -> type-check diagnostics.
     /// Prevents re-type-checking the same module on diamond imports.
     type_check_cache: HashMap<PathBuf, Vec<Diagnostic>>,
+    /// External dependency search paths: dep name → directory containing .bl files.
+    /// Used by `resolve_path` as fallback after local module lookup fails.
+    dep_paths: HashMap<String, PathBuf>,
 }
 
 impl Default for ModuleLoader {
@@ -63,6 +66,7 @@ impl ModuleLoader {
             loaded: HashMap::new(),
             base_dir: None,
             type_check_cache: HashMap::new(),
+            dep_paths: HashMap::new(),
         }
     }
 
@@ -73,7 +77,15 @@ impl ModuleLoader {
             loaded: HashMap::new(),
             base_dir: Some(base_dir),
             type_check_cache: HashMap::new(),
+            dep_paths: HashMap::new(),
         }
+    }
+
+    /// Register an external dependency search path.
+    /// When `import Name` fails local resolution, the resolver checks
+    /// `dep_dir/src/Name.bl` as a fallback.
+    pub fn add_dep_path(&mut self, name: String, dir: PathBuf) {
+        self.dep_paths.insert(name, dir);
     }
 
     /// Get the base directory for imports.
@@ -238,6 +250,76 @@ impl ModuleLoader {
             if candidate.exists() {
                 return Ok(candidate.clone());
             }
+        }
+
+        // Fallback: check external dependency paths.
+        // For `import Json`, check dep_paths["Json"]/src/Json.bl
+        // For `import Json.Parser`, check dep_paths["Json"]/src/Parser.bl
+        let root_name = parts[0];
+        if let Some(dep_dir) = self.dep_paths.get(root_name) {
+            let dep_candidates = if parts.len() == 1 {
+                // `import Json` → dep_dir/src/Json.bl or dep_dir/src/main.bl
+                vec![
+                    dep_dir.join("src").join(format!("{}.bl", root_name)),
+                    dep_dir
+                        .join("src")
+                        .join(format!("{}.bl", root_name.to_lowercase())),
+                    dep_dir.join("src").join("main.bl"),
+                ]
+            } else {
+                // `import Json.Parser` → dep_dir/src/Parser.bl
+                let sub_parts = &parts[1..];
+                let last = sub_parts.last().unwrap();
+                if sub_parts.len() == 1 {
+                    vec![
+                        dep_dir.join("src").join(format!("{}.bl", last)),
+                        dep_dir
+                            .join("src")
+                            .join(format!("{}.bl", last.to_lowercase())),
+                    ]
+                } else {
+                    let dir_parts = &sub_parts[..sub_parts.len() - 1];
+                    let exact_dir: PathBuf = dir_parts.iter().collect();
+                    let lower_dir: PathBuf =
+                        dir_parts.iter().map(|p| p.to_lowercase()).collect();
+                    vec![
+                        dep_dir.join("src").join(&exact_dir).join(format!("{}.bl", last)),
+                        dep_dir
+                            .join("src")
+                            .join(&lower_dir)
+                            .join(format!("{}.bl", last.to_lowercase())),
+                    ]
+                }
+            };
+
+            for candidate in &dep_candidates {
+                if candidate.exists() {
+                    return Ok(candidate.clone());
+                }
+            }
+        }
+
+        // Check if this is a known dependency that hasn't been installed
+        if self.dep_paths.contains_key(root_name) {
+            return Err(Diagnostic {
+                code: "IMP_001".to_string(),
+                severity: Severity::Error,
+                location: Location::from_node(file, import_node),
+                message: format!(
+                    "Module `{}` not found in dependency `{}`",
+                    module_name, root_name
+                ),
+                context: format!(
+                    "Dependency `{}` is declared but the module file was not found.",
+                    root_name
+                ),
+                suggestions: vec![Suggestion {
+                    strategy: "install".to_string(),
+                    description: "Run `blc install` to fetch dependencies.".to_string(),
+                    confidence: Some(0.9),
+                    patch: None,
+                }],
+            });
         }
 
         let tried = candidates
@@ -628,6 +710,136 @@ mod tests {
         assert_eq!(imports.len(), 1, "Tree: {}", root.to_sexp());
         assert_eq!(imports[0].0.module_name, "Math");
         assert!(matches!(imports[0].0.kind, ImportKind::Wildcard));
+    }
+
+    #[test]
+    fn test_resolve_dep_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep_dir = dir.path().join("deps").join("json-pkg");
+        fs::create_dir_all(dep_dir.join("src")).unwrap();
+        fs::write(dep_dir.join("src").join("Json.bl"), "fn parse() -> () = ()").unwrap();
+
+        let mut loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        loader.add_dep_path("Json".to_string(), dep_dir);
+
+        let mut parser = Parser::new();
+        parser.set_language(&LANGUAGE.into()).unwrap();
+        let tree = parser.parse("import Json", None).unwrap();
+        let root = tree.root_node();
+        let import_node = root.named_child(0).unwrap();
+
+        let result = loader.resolve_path("Json", &import_node, "test.bl");
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result);
+        let resolved = result.unwrap();
+        assert!(resolved.to_str().unwrap().contains("Json.bl"));
+    }
+
+    #[test]
+    fn test_resolve_dep_submodule() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep_dir = dir.path().join("deps").join("json-pkg");
+        fs::create_dir_all(dep_dir.join("src")).unwrap();
+        fs::write(
+            dep_dir.join("src").join("Parser.bl"),
+            "fn parse() -> () = ()",
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        loader.add_dep_path("Json".to_string(), dep_dir);
+
+        let mut parser = Parser::new();
+        parser.set_language(&LANGUAGE.into()).unwrap();
+        let tree = parser.parse("import Json", None).unwrap();
+        let root = tree.root_node();
+        let import_node = root.named_child(0).unwrap();
+
+        let result = loader.resolve_path("Json.Parser", &import_node, "test.bl");
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result);
+        let resolved = result.unwrap();
+        assert!(resolved.to_str().unwrap().contains("Parser.bl"));
+    }
+
+    #[test]
+    fn test_resolve_dep_main_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep_dir = dir.path().join("deps").join("json-pkg");
+        fs::create_dir_all(dep_dir.join("src")).unwrap();
+        fs::write(dep_dir.join("src").join("main.bl"), "fn parse() -> () = ()").unwrap();
+
+        let mut loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        loader.add_dep_path("Json".to_string(), dep_dir);
+
+        let mut parser = Parser::new();
+        parser.set_language(&LANGUAGE.into()).unwrap();
+        let tree = parser.parse("import Json", None).unwrap();
+        let root = tree.root_node();
+        let import_node = root.named_child(0).unwrap();
+
+        let result = loader.resolve_path("Json", &import_node, "test.bl");
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result);
+        let resolved = result.unwrap();
+        assert!(resolved.to_str().unwrap().contains("main.bl"));
+    }
+
+    #[test]
+    fn test_resolve_local_takes_precedence_over_dep() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create local Json.bl
+        fs::write(dir.path().join("Json.bl"), "fn local() -> () = ()").unwrap();
+
+        // Also create dep Json
+        let dep_dir = dir.path().join("deps").join("json-pkg");
+        fs::create_dir_all(dep_dir.join("src")).unwrap();
+        fs::write(dep_dir.join("src").join("Json.bl"), "fn dep() -> () = ()").unwrap();
+
+        let mut loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        loader.add_dep_path("Json".to_string(), dep_dir);
+
+        let mut parser = Parser::new();
+        parser.set_language(&LANGUAGE.into()).unwrap();
+        let tree = parser.parse("import Json", None).unwrap();
+        let root = tree.root_node();
+        let import_node = root.named_child(0).unwrap();
+
+        let result = loader.resolve_path("Json", &import_node, "test.bl");
+        assert!(result.is_ok());
+        // Local should win: resolved path should be in the base dir, not deps
+        let resolved = result.unwrap();
+        assert!(
+            !resolved.to_str().unwrap().contains("deps"),
+            "Expected local to take precedence, got {:?}",
+            resolved
+        );
+    }
+
+    #[test]
+    fn test_resolve_missing_dep_suggests_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep_dir = dir.path().join("deps").join("json-pkg");
+        // Don't create any files — dep declared but not installed
+        fs::create_dir_all(&dep_dir).unwrap();
+
+        let mut loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        loader.add_dep_path("Json".to_string(), dep_dir);
+
+        let mut parser = Parser::new();
+        parser.set_language(&LANGUAGE.into()).unwrap();
+        let tree = parser.parse("import Json", None).unwrap();
+        let root = tree.root_node();
+        let import_node = root.named_child(0).unwrap();
+
+        let result = loader.resolve_path("Json", &import_node, "test.bl");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "IMP_001");
+        assert!(
+            err.suggestions
+                .iter()
+                .any(|s| s.description.contains("blc install")),
+            "Expected 'blc install' suggestion, got {:?}",
+            err.suggestions
+        );
     }
 
     #[test]
