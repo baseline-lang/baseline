@@ -23,8 +23,9 @@ baseline/
 ├── blc/                    # Self-contained compiler (Rust)
 │   ├── src/analysis/       # Type, Effect, and Refinement checkers
 │   └── src/parse.rs        # Tree-sitter integration
-├── design/                 # Language specification and design docs
-│   └── baseline-language-specification.md  # Authoritative spec (with status markers)
+├── design/                 # Language specification, roadmap, and design docs
+│   ├── baseline-language-specification.md  # Authoritative spec (with status markers)
+│   └── baseline-language-roadmap.md        # Aspirational features (v0.2+)
 ├── tree-sitter-baseline/   # Grammar definition and parser
 ├── examples/               # Feature demonstrations
 ├── extensions/             # Editor support (Zed, VS Code)

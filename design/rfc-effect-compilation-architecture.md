@@ -210,7 +210,7 @@ The brainstorm document proposed "handler-scoped arenas" — allocating within a
    - Reference counting arena cells individually (reinventing RC with extra complexity)
    - Restricting what values continuations can capture (unacceptable ergonomics)
 
-3. **Interaction with structured concurrency** — the vision doc (`baseline-language-vision.md`) envisions fiber-scoped regions where "fibers can safely borrow region-allocated data without ARC." This requires compiler proof that all fibers die before the region exits. Handler-scoped arenas add another lifetime axis that the compiler must reason about simultaneously.
+3. **Interaction with structured concurrency** — the roadmap doc (`baseline-language-roadmap.md`) envisions fiber-scoped regions where "fibers can safely borrow region-allocated data without ARC." This requires compiler proof that all fibers die before the region exits. Handler-scoped arenas add another lifetime axis that the compiler must reason about simultaneously.
 
 Handler-scoped arenas remain a future possibility if one-shot semantics are chosen and structured concurrency arrives with compile-time lifetime proofs. But they are not a v0.2 target.
 
@@ -463,7 +463,7 @@ Accepting OCaml's pragmatic split means the VM tier will always have NaN-boxing 
 
 ## Relationship to Vision Doc
 
-The vision doc (`design/baseline-language-vision.md`) describes region-based memory, arenas, and structured concurrency. This RFC is compatible with that vision but sequences it differently:
+The roadmap doc (`design/baseline-language-roadmap.md`) describes region-based memory, arenas, and structured concurrency. This RFC is compatible with that roadmap but sequences it differently:
 
 | Vision Doc | This RFC | Status |
 |-----------|----------|--------|
@@ -489,5 +489,5 @@ The key difference: the vision doc presents regions and arenas as near-term. Thi
 | `blc/src/vm/jit/analysis.rs` | `can_jit`, `is_scalar_only`, unboxed scalar analysis |
 | `blc/src/analysis/effects.rs` | Static effect checker (capability checking) |
 | `blc/src/vm/lower/effects.rs` | Effect IR lowering (with expressions, handle blocks) |
-| `design/baseline-language-vision.md` | Vision doc (regions, arenas, structured concurrency) |
+| `design/baseline-language-roadmap.md` | Roadmap doc (regions, arenas, structured concurrency) |
 | `design/rfc-cow-optimizations.md` | CoW RFC (partial reuse analysis already implemented) |

@@ -4,7 +4,7 @@
 
 > A fast, verifiable, dual-audience programming language: native to both LLMs and humans.
 
-> For aspirational features planned for v0.3 and beyond (memory model, compilation targets, advanced testing, concurrency, etc.), see [baseline-language-vision.md](baseline-language-vision.md).
+> For aspirational features planned for v0.2 and beyond (memory model, compilation targets, concurrency, constrained generation, etc.), see [baseline-language-roadmap.md](baseline-language-roadmap.md).
 
 ---
 
@@ -32,7 +32,7 @@ This specification describes both implemented features and planned v0.2 targets.
 - Row polymorphism, Char type, Never type
 - List/record destructuring patterns, match guards, or-patterns
 - Concurrency/fibers, REPL
-- Constrained Generation Protocol (CGP), LLM Bootstrap Kit
+- Constrained Generation Protocol, LLM Bootstrap Kit (see [roadmap](baseline-language-roadmap.md))
 
 ### Implementation Status Key
 
@@ -42,7 +42,7 @@ This specification describes both implemented features and planned v0.2 targets.
 
 See conformance tests in `tests/conformance/` for verified behavior.
 
-> **Note:** The Cranelift JIT is the sole execution backend. Features that relied on the old interpreter (algebraic effect handlers with `handle...with`, concurrency/fibers, REPL) are not yet supported in the JIT path.
+> **Note:** The Cranelift JIT is the sole execution backend. Algebraic effect handlers (`handle...with`) are fully supported via evidence passing (tail-resumptive) and fiber coroutines (non-tail-resumptive). Concurrency/fibers and REPL are not yet supported in the JIT path.
 
 ---
 
@@ -58,13 +58,10 @@ See conformance tests in `tests/conformance/` for verified behavior.
 8. [Specifications](#8-specifications)
 9. [Testing](#9-testing)
 10. [Language Server Protocol and Compiler API](#10-language-server-protocol-and-compiler-api)
-11. [Constrained Generation Protocol](#11-constrained-generation-protocol)
-12. [LLM Bootstrap Kit](#12-llm-bootstrap-kit)
-13. [Standard Library](#13-standard-library)
-14. [Grammar](#14-grammar)
+11. [Standard Library](#11-standard-library)
+12. [Grammar](#12-grammar)
 - [Appendix A: Compiler Errors](#appendix-a-compiler-errors)
-- [Appendix B: Trace Format](#appendix-b-trace-format)
-- [Appendix C: Dual-Audience Design Rationale](#appendix-c-dual-audience-design-rationale)
+- [Appendix B: Dual-Audience Design Rationale](#appendix-b-dual-audience-design-rationale)
 
 ---
 
@@ -83,7 +80,7 @@ Baseline is designed around three core principles:
 ### 1.2 Goals
 
 - **Fast compilation**: Development builds in <200ms [IMPLEMENTED]
-- **Fast execution**: Compiled to native with zero-cost effects and refinements [PARTIAL — Cranelift JIT native compilation implemented; zero-cost effects at runtime planned]
+- **Fast execution**: Compiled to native with zero-cost effects and refinements [PARTIAL — Cranelift JIT native compilation implemented; tail-resumptive effects are zero-cost via evidence passing; non-tail-resumptive effects use fiber coroutines]
 - **Small binaries**: Typical services <5MB [PLANNED]
 - **Verified correctness**: Specifications checked at compile time [PARTIAL — type and effect checking implemented; SMT verification planned]
 - **Portable deployment**: Primary target is WebAssembly [PLANNED]
@@ -179,49 +176,7 @@ fn agent_task!(input: Input) -> {Log, Db.read} Output =
 
 This makes Baseline suitable for **untrusted AI-generated code** execution.
 
-#### 1.5.5 Interactive Refinement Protocol [PLANNED]
-
-The compiler supports a dialogue-based refinement process for LLM integration:
-
-```json
-// LLM submits code
-{ "action": "check", "code": "..." }
-
-// Compiler responds with verification status and active verification level
-{
-  "status": "unverified",
-  "verification_level": "refinements",
-  "higher_level_warnings": [
-    "Full verification has not been run. Use --level=full before merge."
-  ],
-  "obligations": [
-    {
-      "location": { "line": 12, "col": 5 },
-      "property": "user.age >= 0",
-      "context": "Required by NonNegative refinement",
-      "suggestions": [
-        { "action": "assume", "code": "@assume user.age >= 0", "confidence": 0.3 },
-        { "action": "guard", "code": "if user.age < 0 then return Err(InvalidAge)", "confidence": 0.8 },
-        { "action": "query", "question": "What is the schema constraint on users.age?" }
-      ]
-    }
-  ]
-}
-
-// LLM can query for more information
-{ "action": "query", "question": "functions matching User -> String" }
-
-// Compiler responds with available functions
-{
-  "matches": [
-    { "name": "User.name", "type": "User -> String" },
-    { "name": "User.email", "type": "User -> String" },
-    { "name": "format_user", "type": "User -> String" }
-  ]
-}
-```
-
-#### 1.5.6 Token-Efficient Design
+#### 1.5.5 Token-Efficient Design
 
 Baseline's syntax is designed to minimize token consumption while maintaining readability:
 
@@ -1289,9 +1244,14 @@ fn timed!<T, e>(action: () -> {e} T) -> {e, Time} (T, Duration) =
   (result, elapsed)
 ```
 
-### 6.3 Effect Handlers [PARTIAL]
+### 6.3 Effect Handlers [IMPLEMENTED]
 
-The grammar supports `handle`/`with` expressions for algebraic effect handlers. Effect declarations and handler syntax are parsed and type-checked. The evidence transform pass lowers tail-resumptive effects in the IR. However, `handle...with` expressions do not execute in the Cranelift JIT runtime — programs using them fail with "No function definitions found". Full algebraic effect handler execution is planned.
+Baseline supports algebraic effect handlers via `handle`/`with` expressions. Two compilation strategies are used depending on handler form:
+
+- **Tail-resumptive handlers** (body is just `resume(expr)`) are lowered via evidence passing — the handler closure replaces the effect call inline, with zero runtime overhead.
+- **Non-tail-resumptive handlers** (handler does work after `resume()`) use fiber-based coroutines. The body runs on a separate stack; `perform` yields to the parent, and `resume()` switches back. Abort handlers (no `resume` call) are supported — the fiber is cleaned up without resuming.
+
+Both strategies are fully supported in the Cranelift JIT.
 
 **Continuation Semantics.** Baseline uses **one-shot continuations only**: the `resume` parameter in a handler clause can be called exactly once. Attempting to call it twice is a runtime error. This constraint simplifies the effect checker (no need to track continuation linearity), preserves LIFO stack discipline for efficient frame management, and enables reference-count reuse analysis (Perceus-style). The compiler emits a `CAP_005` warning when `resume` is aliased (bound to another name, passed as an argument, or returned from a handler). See `design/rfc-effect-compilation-architecture.md` for the full rationale.
 
@@ -1649,144 +1609,7 @@ implement Endpoints = {
 }
 ```
 
-### 8.4 Specification Verification [PLANNED]
-
-The compiler verifies specifications using SMT solving:
-
-```
-$ baseline check
-
-Checking specifications...
-  ✓ divide: precondition verified
-  ✓ divide: postcondition verified
-  ✓ User: invariants verified
-  ✓ UserApi: all routes type-check
-
-Specifications: 4 verified, 0 failed
-```
-
-### 8.5 Verification Levels [PLANNED]
-
-**v0.2 revision**: Verification levels are surfaced in all compiler output to prevent the "worked locally, broke in CI" problem.
-
-```baseline
-@verify(level: refinements)
-module MyModule
-
-@verify(level: full)
-fn critical_function(input: Input) -> Output = ...
-
-@verify(skip: "Performance critical, manually audited 2024-01-15")
-fn unsafe_but_fast(data: Data) -> Data = ...
-```
-
-| Level | Checks | Speed | Use Case |
-|-------|--------|-------|----------|
-| `types` | Type inference, exhaustiveness | Fast (~ms) | Rapid iteration |
-| `refinements` | Types + refinement constraints | Medium (~100ms) | Development default |
-| `full` | Types + refinements + all specs + SMT | Slow (~seconds) | CI, release |
-| `skip` | Types only, specs unchecked | Fast | Escape hatch |
-
-```bash
-baseline check                    # Uses level from source annotations
-baseline check --level=types      # Fast check only
-baseline check --level=full       # Full verification
-baseline check --timeout=30s      # Set SMT timeout
-```
-
-#### Verification Level Awareness
-
-**Every** compiler response includes the active verification level:
-
-```json
-{
-  "status": "ok",
-  "verification_level": "refinements",
-  "checked": ["types", "refinements"],
-  "unchecked": ["specs", "smt"],
-  "warning": "Postconditions in @spec divide are unchecked at level 'refinements'. Run with --level=full to verify.",
-  "diagnostics": []
-}
-```
-
-This ensures an LLM agent always knows what level of verification passed, what properties remain unverified, and what command to run for full verification.
-
-**Rationale**: In v0.1, an LLM could generate code that passed `--level=refinements`, then CI running `--level=full` would find spec violations. The LLM received confusing feedback — the code "worked" but now "doesn't." Surfacing the level in every response lets the agent proactively run higher checks or annotate its output with the verification level achieved.
-
-#### Handling SMT Timeouts
-
-```json
-{
-  "status": "timeout",
-  "verification_level": "full",
-  "property": "@ensures result.len <= input.len * 2",
-  "timeout_seconds": 10,
-  "suggestions": [
-    { "action": "increase_timeout", "command": "baseline check --timeout=60s", "confidence": 0.3 },
-    { "action": "add_lemma", "description": "Add intermediate lemma to help the solver", "confidence": 0.5 },
-    { "action": "assume", "code": "@assume result.len <= input.len * 2", "confidence": 0.2 },
-    { "action": "skip", "code": "@verify(skip: \"SMT timeout\")", "confidence": 0.1 }
-  ]
-}
-```
-
-#### Assumptions
-
-```baseline
-@spec transform
-@given data: List<Item>
-@returns List<Result>
-@assume db_items_are_valid  // External invariant
-@ensures result.len == data.len
-
-fn transform!(data: List<Item>) -> {Db} List<Result> = ...
-```
-
-Assumptions are tracked by the compiler, reported in summaries, and flagged in constrained generation mode.
-
-### 8.6 The Neurosymbolic Feedback Loop [PLANNED]
-
-Baseline closes the loop between LLM generation and formal verification:
-
-1. **Prompt**: Agent receives type signature with refinements and specifications.
-2. **Generation**: Agent generates code (optionally with constrained generation — §11).
-3. **Verification**: Compiler checks code against refinement types using SMT. Verification level is explicitly reported.
-4. **Feedback**: On failure, compiler produces a **counter-example** with structured suggestions.
-5. **Repair**: Agent fixes code based on counter-example.
-
-This turns the compiler into a **verifier** for the probabilistic output of the LLM. Formal verification as a feedback signal is categorically more powerful than testing alone.
-
-### 8.7 Verified Control / Generated Data Separation
-
-Baseline encourages architecturally separating **verified control flow** from **LLM-generated data transformations**:
-
-```baseline
-// VERIFIED: Control flow is specified and formally checked
-@spec order_pipeline
-@ensures all orders processed or error logged
-@verify(level: full)
-
-fn order_pipeline!(orders: List<Order>) -> {Db, Log, Http} List<Result<Receipt, OrderError>> =
-  orders
-  |> List.map(|order| {
-    let validated = validate(order)?
-    let charged = charge_payment!(validated)?
-    let receipt = generate_receipt(validated, charged)  // LLM-generated
-    Ok(receipt)
-  })
-
-// GENERATED: Data transformation, verified by types + tests
-fn generate_receipt(order: ValidatedOrder, payment: PaymentConfirmation) -> Receipt =
-  Receipt {
-    id: ReceiptId.new(),
-    order_id: order.id,
-    amount: payment.amount,
-    timestamp: payment.timestamp,
-    items: order.items |> List.map(format_line_item),
-  }
-```
-
-The control flow is formally verified. The data transformation is type-checked and tested. Typed holes (§4.9) make this explicit: verified control flow is concrete code, data transformations start as holes.
+For planned verification infrastructure (SMT-based spec verification, verification levels, neurosymbolic feedback loop), see [baseline-language-roadmap.md](baseline-language-roadmap.md) §12–13.
 
 ---
 
@@ -2049,385 +1872,13 @@ Baseline exposes its compiler internals via a queryable API, enabling IDEs, LLMs
 
 Diagnostics (with verification level context), Completion, Hover, Go to Definition, Find References, Rename, Code Actions, Formatting (`baseline fmt` integration).
 
-### 10.3 Extended Query API [PLANNED]
-
-#### Type Queries
-
-```json
-{ "method": "baseline/typeAt", "params": { "file": "src/api.bl", "position": { "line": 42, "character": 15 } } }
-
-// Response
-{ "type": "Option<User>", "expanded": "Some(User) | None", "refinements": [], "effects": [] }
-```
-
-#### Function Search
-
-```json
-{ "method": "baseline/searchByType", "params": { "signature": "List<A> -> (A -> B) -> List<B>", "scope": "visible" } }
-
-// Response
-{
-  "matches": [
-    { "name": "List.map", "module": "Baseline.Collections", "signature": "List<A> -> (A -> B) -> List<B>" }
-  ]
-}
-```
-
-#### Effect Queries
-
-```json
-{ "method": "baseline/availableEffects", "params": { "file": "src/api.bl", "position": { "line": 42, "character": 0 } } }
-
-// Response
-{
-  "effects": [
-    { "name": "Http", "methods": ["get!", "post!", "put!", "delete!"] },
-    { "name": "Db", "methods": ["query!", "execute!", "transaction!"] },
-    { "name": "Log", "methods": ["debug!", "info!", "warn!", "error!"] }
-  ]
-}
-```
-
-#### Specification Queries
-
-```json
-{ "method": "baseline/specFor", "params": { "function": "Api.Users.create_user" } }
-
-// Response
-{
-  "spec": {
-    "given": [{ "name": "body", "type": "UserCreate", "refinements": ["name.len > 0"] }],
-    "returns": { "type": "User | ValidationError" },
-    "ensures": ["result.id > 0 when Ok"],
-    "effects": ["Db"]
-  }
-}
-```
-
-### 10.4 Programmatic Compilation API [PLANNED]
-
-```json
-{
-  "method": "baseline/checkSource",
-  "params": {
-    "source": "let x: Int = \"hello\"",
-    "context": { "imports": ["Baseline.Core.*"], "effects": ["Console"] },
-    "verification_level": "refinements"
-  }
-}
-
-// Response
-{
-  "status": "error",
-  "verification_level": "refinements",
-  "diagnostics": [
-    {
-      "severity": "error",
-      "code": "E0308",
-      "message": "Type mismatch",
-      "location": { "line": 1, "col": 14, "span": 7 },
-      "expected": "Int",
-      "actual": "String",
-      "suggestions": [
-        { "action": "parse", "code": "let x: Int = Int.parse(\"hello\")?", "confidence": 0.6 },
-        { "action": "change_type", "code": "let x: String = \"hello\"", "confidence": 0.8 }
-      ]
-    }
-  ]
-}
-```
-
-### 10.5 Interactive Refinement Session [PLANNED]
-
-```json
-// Start session
-{ "method": "baseline/session/start", "params": { "project": "myapp" } }
-// Response: { "sessionId": "abc123", "default_verification_level": "refinements" }
-
-// Submit code
-{ "method": "baseline/session/check", "params": { "sessionId": "abc123", "file": "src/api.bl", "source": "...", "verification_level": "full" } }
-
-// Query verification failures
-{ "method": "baseline/session/query", "params": { "sessionId": "abc123", "question": "Why can't you prove user.age >= 0?" } }
-
-// Response
-{
-  "answer": "The field `age` in type `User` has type `Int` with no refinement.",
-  "suggestions": [
-    { "action": "add_refinement", "code": "age: Int where self >= 0", "confidence": 0.7 },
-    { "action": "add_guard", "code": "if user.age < 0 then return Err(InvalidAge)", "confidence": 0.6 }
-  ]
-}
-
-// End session
-{ "method": "baseline/session/end", "params": { "sessionId": "abc123" } }
-```
-
-### 10.6 Bulk Operations for LLM Agents [PLANNED]
-
-```json
-{ "method": "baseline/analyzeModule", "params": { "module": "Api.Users", "include": ["types", "functions", "specs", "tests"] } }
-
-// Response
-{ "module": "Api.Users", "types": [...], "functions": [...], "specs": [...], "tests": [...], "dependencies": [...], "dependents": [...] }
-```
+For planned compiler APIs (extended queries, programmatic compilation, interactive sessions, bulk operations), see [baseline-language-roadmap.md](baseline-language-roadmap.md) §14.
 
 ---
 
-## 11. Constrained Generation Protocol [PLANNED]
+## 11. Standard Library
 
-**New in v0.2**
-
-This section specifies how Baseline's type system can be used to **constrain LLM token generation in real time**, preventing ill-typed code from ever being produced.
-
-### 11.1 Motivation
-
-The standard LLM code generation loop is: Generate → Compile → Get errors → Fix → Retry. Each cycle costs time, tokens, and money. Type errors account for 33.6% of all LLM code generation failures.
-
-Research from ETH Zurich demonstrated that type-constrained decoding using prefix automata can cut compilation errors by more than half and increase functional correctness by 3.5–5.5%.
-
-Baseline's type system — with its simple decidable refinements, explicit effect annotations, and mandatory module-boundary signatures — is specifically designed to support this:
-
-```
-Generate (with type constraints at each token) → Compile → Verify specs
-```
-
-The first step produces code **guaranteed to type-check**. The second step only verifies specifications and refinements.
-
-### 11.2 Protocol Specification
-
-The Constrained Generation Protocol (CGP) extends the Interactive Refinement Protocol with token-level guidance:
-
-```json
-// Initialize constrained generation session
-{
-  "method": "baseline/cgp/start",
-  "params": {
-    "sessionId": "abc123",
-    "context": {
-      "file": "src/api.bl",
-      "position": { "line": 42 },
-      "scope": {
-        "bindings": [
-          { "name": "user", "type": "User" },
-          { "name": "config", "type": "ServerConfig" }
-        ],
-        "effects": ["Http", "Log", "Db"],
-        "expected_type": "Result<Response, ApiError>"
-      }
-    }
-  }
-}
-
-// Response: Initial valid token set
-{
-  "sessionId": "abc123",
-  "valid_tokens": ["let", "match", "if", "user", "config", "Http", "Log", "Db", "Ok", "Err"],
-  "invalid_tokens": ["Fs", "Process", "Random"],
-  "reason": { "Fs": "Effect Fs not in scope", "Process": "Effect Process not in scope" }
-}
-```
-
-#### Token-by-Token Constraint Updates
-
-```json
-// LLM generates: "let result = Http."
-{ "method": "baseline/cgp/advance", "params": { "sessionId": "abc123", "tokens": ["let", " result", " =", " Http", "."] } }
-
-// Response: Valid completions after "Http."
-{
-  "valid_tokens": ["get!", "post!", "put!", "delete!", "head!"],
-  "type_context": "Http method call, expecting: String -> Result<Response, HttpError>",
-  "partial_type": "Http.??? : String -> {Http} Result<Response, HttpError>"
-}
-```
-
-#### Effect Enforcement During Generation
-
-```json
-// LLM attempts: "Fs"
-{ "method": "baseline/cgp/advance", "params": { "sessionId": "abc123", "tokens": ["Fs"] } }
-
-// Response: Token rejected
-{
-  "status": "rejected",
-  "reason": "Effect Fs is not in the current capability set {Http, Log, Db}",
-  "valid_alternatives": ["Http", "Log", "Db", "let", "match", "if"],
-  "security_note": "This constraint enforces the capability-based security model"
-}
-```
-
-#### Refinement-Aware Generation
-
-```json
-// Context: fn listen!(port: Port) where Port = Int where 1 <= self <= 65535
-// LLM generates: "listen!(70000)"
-{ "method": "baseline/cgp/advance", "params": { "sessionId": "abc123", "tokens": ["listen!", "(", "70000", ")"] } }
-
-// Response: Refinement violation
-{
-  "status": "refinement_violation",
-  "constraint": "1 <= self <= 65535",
-  "actual_value": 70000,
-  "suggestion": "Use a value between 1 and 65535, or use a variable with Port type"
-}
-```
-
-### 11.3 Implementation Requirements
-
-For the CGP to work efficiently, Baseline's type system must satisfy:
-
-1. **Incremental type checking**: The type of a partial program must be computable after each token. Baseline's bidirectional type inference supports this — the expected type flows down from annotations, and the synthesized type flows up from expressions.
-
-2. **Decidable type membership**: Given a partial token sequence, the set of valid next tokens must be computable in bounded time. Baseline's refinement types use linear arithmetic (decidable) and a restricted regex subset (decidable).
-
-3. **Effect set closure**: The set of valid effect calls is statically known from the function signature. No dynamic dispatch on effects.
-
-4. **Tokenizer alignment**: Baseline's keywords are chosen to align with common BPE tokenizers. Each keyword maps to a single token, preventing the "token misalignment problem" identified in the Domino paper.
-
-### 11.4 Graceful Degradation
-
-Not all LLM deployment environments support constrained generation. The CGP is designed as an optional optimization:
-
-| Mode | Guarantee | Speed | Requirement |
-|------|-----------|-------|-------------|
-| Unconstrained | None | Fastest generation | Standard LLM inference |
-| Grammar-constrained | Syntactically valid | Slight overhead | Grammar-aware sampler |
-| Type-constrained | Type-correct | Moderate overhead | CGP server running |
-| Full-constrained | Type-correct + effects | Higher overhead | CGP server + effect checker |
-
-Each mode is strictly more powerful than the previous. Projects choose their constraint level based on criticality and available infrastructure.
-
-### 11.5 Integration with Existing Infrastructure
-
-The CGP integrates with existing constrained generation frameworks:
-
-- **Outlines/Guidance**: CGP can export Baseline's grammar as a JSON Schema or regex for use with existing structured generation libraries.
-- **vLLM/TGI**: CGP token masks can be provided as logit bias arrays.
-- **Custom inference**: The CGP server provides a simple HTTP API for token validation.
-
----
-
-## 12. LLM Bootstrap Kit [PLANNED]
-
-**New in v0.2**
-
-New languages face a cold-start problem: LLMs generate better code in languages with massive training corpora, but corpora only grow if languages are widely adopted.
-
-### 12.1 `llms.txt` Specification File
-
-Every Baseline installation includes an `llms.txt` file designed for inclusion in LLM system prompts:
-
-```
-# Baseline Language Quick Reference
-
-## Syntax Summary
-- Functions: fn name(param: Type) -> ReturnType = body
-- Effects: fn name!(param: Type) -> {Effect1, Effect2} ReturnType = body
-- Types: type Name = Int where self > 0
-- Pipes: value |> transform |> validate
-- Lambdas: |x| x + 1
-- Pattern matching: match expr { pattern -> result }
-- Error propagation: fallible_operation()?
-- Let bindings: let x = expr
-- Conditionals: if cond then expr1 else expr2
-- Records: { field: value, field2: value2 }
-- Sum types: type T = | Variant1(Type) | Variant2
-- Typed holes: ?? (compiler reports expected type)
-
-## Key Rules
-- Pure functions have no ! suffix and cannot use effects
-- Effectful functions end with ! and declare effects: {Http, Db}
-- All exported functions require type annotations
-- Pattern matching is exhaustive
-- Trailing commas always allowed
-- String interpolation: "Hello, ${name}"
-- No null/undefined/nil — use Option<T> (sugar: T?)
-- No exceptions — use Result<T, E> with ? propagation
-- No classes/inheritance — use records + sum types + effects
-
-## Common Patterns
-fn pure_function(x: Int) -> Int = x * 2
-fn effectful!(x: Int) -> {Db} Result<String, Error> = Db.query!(x)?
-type Validated = String where String.length(self) > 0
-let result = input |> parse |> validate |> transform
-```
-
-### 12.2 Canonical Few-Shot Examples
-
-The distribution includes curated examples covering common patterns:
-
-```baseline
-// Example: CRUD API endpoint
-@prelude(server)
-module Examples.Crud
-
-export type Todo = {
-  id: Int where self > 0,
-  title: String where String.length(self) > 0,
-  completed: Bool,
-}
-
-type CreateTodo = {
-  title: String where String.length(self) > 0,
-}
-
-export fn list_todos!() -> {Db} List<Todo> =
-  Db.query!("SELECT * FROM todos")
-
-export fn get_todo!(id: Int) -> {Db} Result<Todo, NotFound> =
-  Db.query_one!("SELECT * FROM todos WHERE id = ?", id)
-  |> Option.ok_or(NotFound)
-
-export fn create_todo!(body: CreateTodo) -> {Db} Todo =
-  Db.insert!("todos", { title: body.title, completed: false })
-
-export fn delete_todo!(id: Int) -> {Db} Result<(), NotFound> =
-  let deleted = Db.delete!("todos", id)
-  if deleted then Ok(()) else Err(NotFound)
-
-// Example: Pure data transformation with inline tests
-fn summarize(todos: List<Todo>) -> { total: Int, completed: Int, pending: Int } =
-  let total = List.length(todos)
-  let completed = todos |> List.filter(|t| t.completed) |> List.length
-  { total: total, completed: completed, pending: total - completed }
-
-@test
-test "empty list" = summarize([]) == { total: 0, completed: 0, pending: 0 }
-test "mixed" = summarize([
-  { id: 1, title: "A", completed: true },
-  { id: 2, title: "B", completed: false },
-]) == { total: 2, completed: 1, pending: 1 }
-```
-
-### 12.3 Training Corpus Strategy
-
-To maximize LLM generability without requiring fine-tuning:
-
-1. **Syntactic proximity**: Baseline's `fn`/`let`/`match`/`if-then-else` syntax is deliberately close to Rust, OCaml, F#, and Kotlin — languages with substantial representation in training corpora.
-
-2. **Standard library naming**: Function names follow widely-adopted conventions (`map`, `filter`, `fold`, `unwrap`, `ok_or`) shared across Rust, Haskell, OCaml, and Scala.
-
-3. **Progressive complexity**: Few-shot examples are ordered from simple (pure functions with inline tests) to complex (effectful APIs with specifications).
-
-4. **Negative examples**: The `llms.txt` explicitly shows what syntax does NOT exist, helping LLMs avoid generating patterns from other languages.
-
-### 12.4 Model Compatibility Testing
-
-The project maintains a benchmark suite:
-
-```bash
-baseline benchmark --model claude-sonnet --tasks standard
-baseline benchmark --model gpt-4 --tasks standard
-```
-
-This produces structured output comparing pass rates, token efficiency, and feedback loop iterations across models, enabling data-driven syntax decisions.
-
----
-
-## 13. Standard Library
-
-### 13.1 Core Types
+### 11.1 Core Types
 
 ```baseline
 module Baseline.Core
@@ -2454,7 +1905,7 @@ export fn Result.unwrap<T, E>(res: Result<T, E>) -> T
 export fn Result.unwrap_or<T, E>(res: Result<T, E>, default: T) -> T
 ```
 
-### 13.2 Collections
+### 11.2 Collections
 
 ```baseline
 module Baseline.Collections
@@ -2493,7 +1944,7 @@ export fn Set.union<T>(a: Set<T>, b: Set<T>) -> Set<T>
 export fn Set.intersection<T>(a: Set<T>, b: Set<T>) -> Set<T>
 ```
 
-### 13.3 Text
+### 11.3 Text
 
 ```baseline
 module Baseline.Text
@@ -2518,7 +1969,7 @@ export fn Regex.is_match(re: Regex, s: String) -> Bool             // [PLANNED]
 export fn Regex.captures(re: Regex, s: String) -> List<String>?    // [PLANNED]
 ```
 
-### 13.4 IO and Expanded Standard Library [PARTIAL]
+### 11.4 IO and Expanded Standard Library [PARTIAL]
 
 The standard library provides a toolkit optimized for web and database workflows:
 - **Core:** `Console`, `Env`, `Fs`, `Math`, `Random`, `DateTime`, `Time`. [IMPLEMENTED]
@@ -2560,9 +2011,9 @@ export type Metadata = {                     // [PLANNED]
 
 ---
 
-## 14. Grammar
+## 12. Grammar
 
-### 14.1 Notation
+### 12.1 Notation
 
 - `'text'` — Terminal (literal text)
 - `Name` — Non-terminal
@@ -2572,7 +2023,7 @@ export type Metadata = {                     // [PLANNED]
 - `A+` — One or more
 - `(A B)` — Grouping
 
-### 14.2 Lexical Grammar
+### 12.2 Lexical Grammar
 
 ```ebnf
 whitespace = ' ' | '\t' | '\n' | '\r'
@@ -2616,7 +2067,7 @@ operator = '+' | '-' | '*' | '/' | '%'         (* [IMPLEMENTED] *)
          | '++' | '..'                           (* [IMPLEMENTED] *)
 ```
 
-### 14.3 Syntactic Grammar
+### 12.3 Syntactic Grammar
 
 ```ebnf
 (* Module *)
@@ -2813,51 +2264,11 @@ All compiler errors follow this JSON schema:
 
 ---
 
-## Appendix B: Trace Format `[PLANNED]`
-
-Traces are stored in a binary format for efficiency:
-
-```
-TraceFile {
-  magic: [u8; 4] = "BLTC"
-  version: u16
-  flags: u16
-  event_count: u64
-  events: [TraceEvent; event_count]
-}
-
-TraceEvent {
-  timestamp_ns: u64
-  location: Location
-  event_type: EventType
-  payload: [u8; *]
-}
-
-Location {
-  file_id: u16
-  line: u32
-  col: u16
-}
-
-EventType {
-  FunctionCall = 0x01
-  FunctionReturn = 0x02
-  EffectExecuted = 0x03
-  VariableAssign = 0x04
-  BranchTaken = 0x05
-  Allocation = 0x06
-  Deallocation = 0x07
-  Error = 0x08
-}
-```
-
----
-
-## Appendix C: Dual-Audience Design Rationale
+## Appendix B: Dual-Audience Design Rationale
 
 This appendix documents the empirical research that informed v0.2 design decisions.
 
-### C.1 Function Syntax Change
+### B.1 Function Syntax Change
 
 **v0.1**: `greet : String -> String` / `greet = |name| "Hello, ${name}"`
 **v0.2**: `fn greet(name: String) -> String = "Hello, ${name}"`
@@ -2866,7 +2277,7 @@ This appendix documents the empirical research that informed v0.2 design decisio
 
 **Human impact**: Minimal. Both syntaxes are readable. The `fn` keyword provides a visual anchor for scanning code. Parameter-type co-location reduces eye movement when reading function signatures.
 
-### C.2 Test Syntax Change
+### B.2 Test Syntax Change
 
 **BDD assertions (v0.1 → v0.2):**
 **v0.1**: `given [3, 1, 4] / when List.sort / expect [1, 1, 3, 4, 5]`
@@ -2884,7 +2295,7 @@ This appendix documents the empirical research that informed v0.2 design decisio
 
 **Human impact**: Tests are no longer coupled to individual function definitions, which is more flexible — a single `@test` section can test multiple functions. The visual separation also makes files easier to scan.
 
-### C.3 Bounded Row Polymorphism
+### B.3 Bounded Row Polymorphism
 
 **v0.1**: Unbounded row polymorphism everywhere
 **v0.2**: Row variables resolved to concrete types at module boundaries
@@ -2893,7 +2304,7 @@ This appendix documents the empirical research that informed v0.2 design decisio
 
 **Human impact**: Minimal. Internal functions retain full flexibility. Exported functions require either concrete types or named aliases, which is better documentation practice regardless.
 
-### C.4 Verification Level Surfacing
+### B.4 Verification Level Surfacing
 
 **v0.1**: Verification level was a CLI flag
 **v0.2**: Verification level is reported in every compiler response
@@ -2902,7 +2313,7 @@ This appendix documents the empirical research that informed v0.2 design decisio
 
 **Human impact**: Positive. Developers also benefit from knowing whether their code has passed type checking only vs. full specification verification.
 
-### C.5 Constrained Generation Protocol
+### B.5 Constrained Generation Protocol
 
 **v0.1**: Not present
 **v0.2**: Full protocol specification
