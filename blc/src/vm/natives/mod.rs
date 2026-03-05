@@ -653,6 +653,7 @@ impl NativeRegistry {
         self.register("Map.has", native_map_contains);
         self.register("Map.size", native_map_len);
         self.register("Map.from_list", native_map_from_list);
+        self.register("Map.entries", native_map_entries);
 
         // -- Set --
         self.register("Set.empty", native_set_empty);

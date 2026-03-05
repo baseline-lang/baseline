@@ -1,0 +1,20 @@
+@prelude(core)
+
+// Conformance: Map.entries
+
+test "entries of empty map" = {
+  let m = Map.empty()
+  Map.entries(m) == []
+}
+
+test "entries returns tuples" = {
+  let m = Map.insert(Map.insert(Map.empty(), "a", 1), "b", 2)
+  let es = Map.entries(m)
+  List.length(es) == 2
+}
+
+test "entries round-trip via from_list" = {
+  let m = Map.from_list([("x", 10), ("y", 20)])
+  let m2 = Map.from_list(Map.entries(m))
+  Map.get(m2, "x") == Some(10)
+}

@@ -142,6 +142,19 @@ pub(super) fn native_map_len(args: &[NValue]) -> Result<NValue, NativeError> {
     }
 }
 
+pub(super) fn native_map_entries(args: &[NValue]) -> Result<NValue, NativeError> {
+    match args[0].as_heap_ref() {
+        HeapObject::Map(entries) => {
+            let pairs: Vec<_> = entries
+                .iter()
+                .map(|(k, v)| NValue::tuple(vec![k.clone(), v.clone()]))
+                .collect();
+            Ok(NValue::list(pairs))
+        }
+        _ => Err(NativeError("Map.entries: expected Map".into())),
+    }
+}
+
 pub(super) fn native_map_from_list(args: &[NValue]) -> Result<NValue, NativeError> {
     match args[0].as_list() {
         Some(items) => {

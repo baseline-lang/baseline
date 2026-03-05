@@ -1,0 +1,33 @@
+fn map(m: Map<K, V>, f: (V) -> U) -> Map<K, U> =
+  map_loop(Map.entries(m), f, Map.empty())
+
+fn map_loop(xs: List<(K, V)>, f: (V) -> U, acc: Map<K, U>) -> Map<K, U> =
+  match xs
+    [] -> acc
+    [pair, ..rest] -> {
+      let (k, v) = pair
+      map_loop(rest, f, Map.insert(acc, k, f(v)))
+    }
+
+fn filter(m: Map<K, V>, f: (K, V) -> Bool) -> Map<K, V> =
+  filter_loop(Map.entries(m), f, Map.empty())
+
+fn filter_loop(xs: List<(K, V)>, f: (K, V) -> Bool, acc: Map<K, V>) -> Map<K, V> =
+  match xs
+    [] -> acc
+    [pair, ..rest] -> {
+      let (k, v) = pair
+      if f(k, v) then filter_loop(rest, f, Map.insert(acc, k, v))
+      else filter_loop(rest, f, acc)
+    }
+
+fn fold(m: Map<K, V>, init: U, f: (U, K, V) -> U) -> U =
+  fold_loop(Map.entries(m), init, f)
+
+fn fold_loop(xs: List<(K, V)>, acc: U, f: (U, K, V) -> U) -> U =
+  match xs
+    [] -> acc
+    [pair, ..rest] -> {
+      let (k, v) = pair
+      fold_loop(rest, f(acc, k, v), f)
+    }

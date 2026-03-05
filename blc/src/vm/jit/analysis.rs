@@ -97,6 +97,9 @@ pub(super) fn expr_can_jit(expr: &Expr, natives: Option<&NativeRegistry>) -> boo
                             | "List.filter"
                             | "List.fold"
                             | "List.find"
+                            | "Map.map"
+                            | "Map.filter"
+                            | "Map.fold"
                             | "Option.map"
                             | "Result.map"
                             | "Result.map_err"
@@ -121,6 +124,9 @@ pub(super) fn expr_can_jit(expr: &Expr, natives: Option<&NativeRegistry>) -> boo
                     | "List.filter"
                     | "List.fold"
                     | "List.find"
+                    | "Map.map"
+                    | "Map.filter"
+                    | "Map.fold"
                     | "Option.map"
                     | "Result.map"
                     | "Result.map_err"
@@ -484,6 +490,7 @@ pub(super) fn compute_unboxed_flags(module: &IrModule) -> Vec<bool> {
         .map(|(i, f)| {
             i != module.entry
                 && is_scalar_only(f)
+                && matches!(f.ty, Some(Type::Int))
                 && !f.name.starts_with("__lambda_")
                 && !indirect_targets.contains(&f.name)
         })

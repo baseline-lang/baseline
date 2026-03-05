@@ -10,6 +10,7 @@ use super::lower::Lowerer;
 use super::natives::NativeRegistry;
 
 const LIST_SOURCE: &str = include_str!("../../../stdlib/List.bl");
+const MAP_SOURCE: &str = include_str!("../../../stdlib/Map.bl");
 const OPTION_SOURCE: &str = include_str!("../../../stdlib/Option.bl");
 const RESULT_SOURCE: &str = include_str!("../../../stdlib/Result.bl");
 
@@ -23,6 +24,7 @@ pub fn compile_stdlib(natives: &NativeRegistry) -> (Vec<IrFunction>, Vec<String>
 
     for (prefix, source) in [
         ("List", LIST_SOURCE),
+        ("Map", MAP_SOURCE),
         ("Option", OPTION_SOURCE),
         ("Result", RESULT_SOURCE),
     ] {
@@ -231,6 +233,7 @@ fn patch_references(expr: &mut Expr, prefix: &str, old_name: &str, qualified_nam
 fn is_stdlib_function(prefix: &str, name: &str) -> bool {
     match prefix {
         "List" => matches!(name, "map" | "filter" | "fold" | "find"),
+        "Map" => matches!(name, "map" | "map_loop" | "filter" | "filter_loop" | "fold" | "fold_loop"),
         "Option" => matches!(name, "map" | "flat_map"),
         "Result" => matches!(name, "map" | "map_err" | "and_then"),
         _ => false,

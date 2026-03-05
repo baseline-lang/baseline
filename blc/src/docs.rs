@@ -805,6 +805,30 @@ fn known_functions() -> Vec<(
             "Create a map from a list of (key, value) pairs.",
             Some("Map.from_list([(\"a\", 1), (\"b\", 2)])"),
         ),
+        (
+            "Map",
+            "entries",
+            "Return all entries as a list of (key, value) tuples.",
+            Some("Map.entries(map)  // => [(\"a\", 1), (\"b\", 2)]"),
+        ),
+        (
+            "Map",
+            "map",
+            "Transform each value by applying a function, returning a new map.",
+            Some("Map.map(scores, fn (v) -> v * 2)"),
+        ),
+        (
+            "Map",
+            "filter",
+            "Keep only entries where the predicate returns true.",
+            Some("Map.filter(map, fn (k, v) -> v > 0)"),
+        ),
+        (
+            "Map",
+            "fold",
+            "Reduce all entries to a single value using an accumulator.",
+            Some("Map.fold(scores, 0, fn (acc, k, v) -> acc + v)"),
+        ),
         // -- Set --
         ("Set", "empty", "Create an empty set.", None),
         (

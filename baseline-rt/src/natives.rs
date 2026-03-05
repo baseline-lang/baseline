@@ -831,6 +831,21 @@ pub extern "C" fn bl_map_from_list(args: *const u64, count: u64) -> u64 {
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn bl_map_entries(args: *const u64, count: u64) -> u64 {
+    let vals = args_from_raw(args, count);
+    match vals[0].as_heap_ref() {
+        HeapObject::Map(entries) => {
+            let pairs: Vec<_> = entries
+                .iter()
+                .map(|(k, v)| NValue::tuple(vec![k.clone(), v.clone()]))
+                .collect();
+            push_result(NValue::list(pairs))
+        }
+        _ => native_error("Map.entries: expected Map".into()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Set
 // ---------------------------------------------------------------------------

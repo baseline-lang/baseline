@@ -366,6 +366,10 @@ pub(super) fn builtin_type_signatures(prelude: &Prelude) -> HashMap<String, Type
             "Map.from_list".into(),
             Type::Function(vec![Type::Unknown], Box::new(Type::Unknown)),
         );
+        sigs.insert(
+            "Map.entries".into(),
+            Type::Function(vec![Type::Unknown], Box::new(Type::Unknown)),
+        );
     }
 
     // -- Set native methods (use Unknown for element type) --

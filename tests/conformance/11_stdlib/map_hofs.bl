@@ -1,0 +1,47 @@
+@prelude(core)
+
+// Conformance: Map HOFs (map, filter, fold)
+
+test "map doubles values" = {
+  let m = Map.from_list([("a", 1), ("b", 2), ("c", 3)])
+  let m2 = Map.map(m, |v| v * 2)
+  Map.get(m2, "a") == Some(2)
+}
+
+test "map preserves keys" = {
+  let m = Map.from_list([("x", 10)])
+  let m2 = Map.map(m, |v| v + 1)
+  Map.size(m2) == 1
+}
+
+test "filter keeps matching entries" = {
+  let m = Map.from_list([("a", 1), ("b", 2), ("c", 3)])
+  let m2 = Map.filter(m, |k, v| v > 1)
+  Map.has(m2, "a") == false
+}
+
+test "filter result size" = {
+  let m = Map.from_list([("a", 1), ("b", 2), ("c", 3)])
+  let m2 = Map.filter(m, |k, v| v > 1)
+  Map.size(m2) == 2
+}
+
+test "fold sums values" = {
+  let m = Map.from_list([("a", 1), ("b", 2), ("c", 3)])
+  Map.fold(m, 0, |acc, k, v| acc + v) == 6
+}
+
+test "fold on empty map" = {
+  let m = Map.empty()
+  Map.fold(m, 42, |acc, k, v| acc + v) == 42
+}
+
+test "map on empty map" = {
+  let m = Map.empty()
+  Map.size(Map.map(m, |v| v)) == 0
+}
+
+test "filter on empty map" = {
+  let m = Map.empty()
+  Map.size(Map.filter(m, |k, v| true)) == 0
+}
