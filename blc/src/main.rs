@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use blc::diagnostics::{self, CheckResult};
+use blc::manifest;
 use blc::parse;
 use blc::resolver;
 use blc::test_runner;
@@ -108,6 +110,19 @@ enum Commands {
     /// Start the MCP (Model Context Protocol) server over stdio
     #[cfg(feature = "mcp")]
     Mcp,
+
+    /// Add a dependency to baseline.toml
+    Add {
+        /// URL of the package tarball (e.g. https://github.com/user/pkg/archive/v1.0.tar.gz)
+        url: String,
+
+        /// Package name (inferred from URL if not provided)
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Fetch all dependencies declared in baseline.toml
+    Install,
 
     /// Generate standard library documentation
     Docs {
@@ -279,6 +294,12 @@ fn main() {
         Commands::Init { name } => {
             init_project(name);
         }
+        Commands::Add { url, name } => {
+            add_dependency(&url, name.as_deref());
+        }
+        Commands::Install => {
+            install_dependencies();
+        }
 
         #[cfg(feature = "mcp")]
         Commands::Mcp => {
@@ -419,6 +440,23 @@ fn compile_to_ir(file: &PathBuf) -> CompileResult {
         Some(dir) => resolver::ModuleLoader::with_base_dir(dir.clone()),
         None => resolver::ModuleLoader::new(),
     };
+
+    // Load manifest and register dependency paths
+    let cwd = file
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
+    if let Some((m, manifest_dir)) = manifest::load_manifest(&cwd) {
+        for (name, dep) in &m.dependencies {
+            let dep_dir = match dep {
+                manifest::Dependency::Url { hash, .. } => {
+                    manifest_dir.join(".baseline").join("deps").join(hash)
+                }
+                manifest::Dependency::Path { path } => manifest_dir.join(path),
+            };
+            loader.add_dep_path(name.clone(), dep_dir);
+        }
+    }
 
     // Type checking: always use loader-aware variant (handles the no-imports case fine)
     let (type_diags, type_map, dict_map) = {
@@ -912,6 +950,226 @@ fn print_json_with_context(result: &CheckResult, source: &str) {
     }
 
     println!("{}", serde_json::to_string_pretty(&json_val).unwrap());
+}
+
+fn add_dependency(url: &str, name: Option<&str>) {
+    let cwd = std::env::current_dir().unwrap();
+    let (_, manifest_dir) = match manifest::load_manifest(&cwd) {
+        Some(pair) => pair,
+        None => {
+            eprintln!("Error: No baseline.toml found. Run `blc init` first.");
+            std::process::exit(1);
+        }
+    };
+
+    // Infer package name from URL if not provided
+    let pkg_name = match name {
+        Some(n) => n.to_string(),
+        None => infer_package_name(url).unwrap_or_else(|| {
+            eprintln!("Error: Could not infer package name from URL. Use --name to specify.");
+            std::process::exit(1);
+        }),
+    };
+
+    println!("Fetching {}...", url);
+
+    // Download and hash
+    let (bytes, hash) = match fetch_and_hash(url) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Error: Failed to fetch {}: {}", url, e);
+            std::process::exit(1);
+        }
+    };
+
+    // Extract to .baseline/deps/<hash>/
+    let deps_dir = manifest_dir.join(".baseline").join("deps").join(&hash);
+    if !deps_dir.exists() {
+        if let Err(e) = extract_tarball(&bytes, &deps_dir) {
+            eprintln!("Error: Failed to extract package: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Append to baseline.toml
+    let manifest_path = manifest_dir.join("baseline.toml");
+    let content = std::fs::read_to_string(&manifest_path).unwrap();
+    let dep = manifest::Dependency::Url {
+        url: url.to_string(),
+        hash: hash.clone(),
+    };
+    let updated = manifest::append_dependency(&content, &pkg_name, &dep);
+    std::fs::write(&manifest_path, updated).unwrap();
+
+    println!("Added {} ({})", pkg_name, hash);
+}
+
+fn install_dependencies() {
+    let cwd = std::env::current_dir().unwrap();
+    let (manifest, manifest_dir) = match manifest::load_manifest(&cwd) {
+        Some(pair) => pair,
+        None => {
+            eprintln!("Error: No baseline.toml found. Run `blc init` first.");
+            std::process::exit(1);
+        }
+    };
+
+    if manifest.dependencies.is_empty() {
+        println!("No dependencies to install.");
+        return;
+    }
+
+    let mut installed = 0;
+    let mut cached = 0;
+
+    for (name, dep) in &manifest.dependencies {
+        match dep {
+            manifest::Dependency::Url { url, hash } => {
+                let deps_dir = manifest_dir.join(".baseline").join("deps").join(hash);
+                if deps_dir.exists() {
+                    cached += 1;
+                    continue;
+                }
+
+                println!("Fetching {}...", name);
+                let (bytes, actual_hash) = match fetch_and_hash(url) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        eprintln!("Error: Failed to fetch {}: {}", name, e);
+                        std::process::exit(1);
+                    }
+                };
+
+                if actual_hash != *hash {
+                    eprintln!(
+                        "Error: Hash mismatch for {}!\n  expected: {}\n  actual:   {}",
+                        name, hash, actual_hash
+                    );
+                    eprintln!("This may indicate a corrupted download or tampered package.");
+                    std::process::exit(1);
+                }
+
+                if let Err(e) = extract_tarball(&bytes, &deps_dir) {
+                    eprintln!("Error: Failed to extract {}: {}", name, e);
+                    std::process::exit(1);
+                }
+
+                installed += 1;
+            }
+            manifest::Dependency::Path { path } => {
+                let dep_path = manifest_dir.join(path);
+                if !dep_path.exists() {
+                    eprintln!("Warning: Path dependency {} not found: {}", name, path);
+                }
+            }
+        }
+    }
+
+    println!(
+        "Done. {} installed, {} cached, {} path deps.",
+        installed,
+        cached,
+        manifest
+            .dependencies
+            .iter()
+            .filter(|(_, d)| matches!(d, manifest::Dependency::Path { .. }))
+            .count()
+    );
+}
+
+/// Infer a PascalCase package name from a URL.
+/// e.g. "https://github.com/user/baseline-json/archive/v1.0.tar.gz" → "Json"
+fn infer_package_name(url: &str) -> Option<String> {
+    // Strip protocol
+    let url_path = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+
+    let parts: Vec<&str> = url_path.split('/').collect();
+    // Look for the segment before "archive" or "releases"
+    let repo_name = parts
+        .iter()
+        .position(|&p| p == "archive" || p == "releases")
+        .and_then(|i| if i > 0 { parts.get(i - 1) } else { None })
+        .or_else(|| parts.get(1))?;
+
+    // Strip common prefixes
+    let clean = repo_name
+        .strip_prefix("baseline-")
+        .or_else(|| repo_name.strip_prefix("bl-"))
+        .unwrap_or(repo_name);
+
+    // PascalCase
+    Some(
+        clean
+            .split('-')
+            .map(|s| {
+                let mut c = s.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().to_string() + &c.collect::<String>(),
+                    None => String::new(),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Download a URL and compute its sha256 hash.
+fn fetch_and_hash(url: &str) -> Result<(Vec<u8>, String), String> {
+    use sha2::{Digest, Sha256};
+
+    let response = ureq::get(url)
+        .call()
+        .map_err(|e| format!("HTTP error: {}", e))?;
+
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Read error: {}", e))?;
+
+    let hash = Sha256::digest(&bytes);
+    let hash_str = format!("sha256-{}", hex::encode(hash));
+
+    Ok((bytes, hash_str))
+}
+
+/// Extract a tarball (.tar.gz) into a directory.
+fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    std::fs::create_dir_all(dest).map_err(|e| format!("mkdir: {}", e))?;
+
+    let decoder = GzDecoder::new(bytes);
+    let mut archive = Archive::new(decoder);
+
+    // Extract, stripping the first path component (e.g., "repo-v1.0.0/")
+    for entry in archive.entries().map_err(|e| format!("tar: {}", e))? {
+        let mut entry = entry.map_err(|e| format!("tar entry: {}", e))?;
+        let path = entry.path().map_err(|e| format!("path: {}", e))?;
+        let components: Vec<_> = path.components().collect();
+        if components.len() <= 1 {
+            continue; // Skip the top-level directory itself
+        }
+        let stripped: PathBuf = components[1..].iter().collect();
+        let target = dest.join(&stripped);
+
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;
+        }
+
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&target).map_err(|e| format!("mkdir: {}", e))?;
+        } else {
+            let mut file =
+                std::fs::File::create(&target).map_err(|e| format!("create: {}", e))?;
+            std::io::copy(&mut entry, &mut file).map_err(|e| format!("copy: {}", e))?;
+        }
+    }
+
+    Ok(())
 }
 
 fn print_test_results(result: &test_runner::TestSuiteResult) {
