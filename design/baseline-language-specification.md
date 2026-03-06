@@ -18,14 +18,14 @@ This specification describes both implemented features and planned targets. Feat
 - Pattern matching with constructors, literals, wildcards, and variable binding
 - Algebraic effect declarations, checking, inference, and handlers (evidence passing + one-shot continuations)
 - Module system with imports, transitive resolution, and cycle detection
-- Refinement types with integer interval constraints and SMT verification
+- Refinement types with integer interval constraints and compile-time verification
 - BDD-style testing framework (describe/it/test/expect)
 - Pipe operator (`|>`) with implicit first-arg piping
 - Standard library: 38 modules, 260+ native functions
 - Cranelift JIT runtime with tail-call optimization and native code execution
 - Language server (diagnostics, hover, go-to-definition, completion)
 - Code formatter (`blc fmt`) and documentation generator (`blc docs`)
-- Server framework: Router, Http client, Jwt, Session, Validate, WebSocket
+- Server framework: Router, Jwt, Session, Validate, Multipart, WebSocket (Http client type-checks but has no runtime yet)
 
 **Not yet available:**
 - User-defined generic functions (builtin generic inference works)
@@ -82,7 +82,7 @@ Baseline is designed around three core principles:
 - **Fast compilation**: Development builds in <200ms [IMPLEMENTED]
 - **Fast execution**: Compiled to native with zero-cost effects and refinements [PARTIAL — Cranelift JIT native compilation implemented; tail-resumptive effects are zero-cost via evidence passing; non-tail-resumptive effects use fiber coroutines]
 - **Small binaries**: Typical services <5MB [PLANNED]
-- **Verified correctness**: Specifications checked at compile time [PARTIAL — type and effect checking implemented; SMT verification planned]
+- **Verified correctness**: Specifications checked at compile time [PARTIAL — type checking, effect checking, and integer interval refinement verification implemented; full SMT verification planned]
 - **Portable deployment**: Primary target is WebAssembly [PLANNED]
 - **Constrained generation**: Type system supports real-time token filtering during LLM generation [PLANNED]
 - **Zero-shot generability**: Syntax close enough to ML-family languages that LLMs can generate valid Baseline without fine-tuning [IMPLEMENTED]
@@ -677,7 +677,7 @@ _       // Wildcard pattern
 
 ### 2.7 Canonical Formatting
 
-Baseline ships with `baseline fmt`, which enforces a single canonical format. Like Go's `gofmt`, this is not optional — CI pipelines should reject unformatted code. [PARTIAL — formatting conventions defined; standalone `baseline fmt` CLI not yet implemented]
+Baseline ships with `blc fmt`, which enforces a single canonical format. Like Go's `gofmt`, this is not optional — CI pipelines should reject unformatted code. [IMPLEMENTED]
 
 The canonical format:
 - 2-space indentation
@@ -1383,12 +1383,12 @@ fn handle_checkout(req: Request) -> {Db} Response = {
 | Effect | Description | Ambient | Status |
 |--------|-------------|---------|--------|
 | `Console` | Terminal I/O | No | [IMPLEMENTED] |
-| `Http` | HTTP client | No | [IMPLEMENTED] |
+| `Http` | HTTP client | No | [PARTIAL — type signatures exist; runtime dispatch planned] |
 | `Fs` | File system | No | [IMPLEMENTED] |
 | `Net` | TCP/UDP sockets | No | [PLANNED] |
-| `Db` | Database access | No | [IMPLEMENTED] |
+| `Db` | Database access (via `Sqlite`, `Postgres`, `Mysql`) | No | [IMPLEMENTED] |
 | `Time` | Current time, delays | **Yes** | [IMPLEMENTED] |
-| `Random` | Random number generation | **Yes** | [IMPLEMENTED] |
+| `Random` | Random number generation | No | [IMPLEMENTED] |
 | `Env` | Environment variables | No | [IMPLEMENTED] |
 | `Process` | Spawn processes | No | [PLANNED] |
 | `Log` | Structured logging | **Yes** | [IMPLEMENTED] |
@@ -1411,10 +1411,10 @@ fn main!() =
 |---------|-------------|-------------------|----------|
 | `none` | (nothing) | (nothing) | Bare minimum |
 | `minimal` | Option, Result | (none) | Minimal programs |
-| `pure` | Option, Result, String, List, Json, Math | (none) | Pure computation |
-| `core` | Option, Result, String, List, Map, Set, Json, Math, Int | (none) | General computation |
-| `script` | (all core) | Console, Log, Time, Random, Env, Fs | CLI tools |
-| `server` | (all core) + Router, Request, Response, Server | Console, Log, Time, Env, Server, Db, Metrics | Web servers |
+| `pure` | Option, Result, String, List, Json, Math, Crypto, Float | (none) | Pure computation |
+| `core` | (all pure) + Map, Set, Weak, Int | (none) | General computation |
+| `script` | (all core) + Http, Response, Request, HttpError, Middleware, Cell, Scope, DateTime | Console, Log, Time, Random, Env, Fs, Async | CLI tools |
+| `server` | (all script) + Router, Ws, Row, Jwt, Session, Validate | Console, Log, Time, Env, Server, Sqlite, Postgres, Mysql, Sql, Metrics, Random, Async | Web servers |
 
 Custom preludes via `baseline.toml` [PLANNED]:
 
@@ -1505,8 +1505,8 @@ my-project/
 ### 7.5 Visibility
 
 ```baseline
-export fn    // Public: accessible from any module [PARTIAL — parsed but not enforced]
-fn           // Private: accessible only within this module [PARTIAL — currently public]
+export fn    // Public: accessible from any module [IMPLEMENTED]
+fn           // Private: accessible only within this module [IMPLEMENTED]
 internal fn  // Internal: accessible within the same package [PLANNED]
 ```
 
@@ -1868,9 +1868,9 @@ fn validate_password(password: String) -> Result<(), PasswordError> =
 
 Baseline exposes its compiler internals via a queryable API, enabling IDEs, LLMs, and automated tools to interact with the language semantically.
 
-### 10.2 Standard LSP Features [PARTIAL — LSP stub exists with basic diagnostics; most features planned]
+### 10.2 Standard LSP Features [PARTIAL]
 
-Diagnostics (with verification level context), Completion, Hover, Go to Definition, Find References, Rename, Code Actions, Formatting (`baseline fmt` integration).
+Diagnostics (with verification level context) [IMPLEMENTED], Completion (local symbols + module methods) [IMPLEMENTED], Hover (type information) [IMPLEMENTED], Go to Definition (local + cross-module) [IMPLEMENTED], Find References [PLANNED], Rename [PLANNED], Code Actions [PLANNED], Formatting (`blc fmt` integration) [PLANNED].
 
 For planned compiler APIs (extended queries, programmatic compilation, interactive sessions, bulk operations), see [baseline-language-roadmap.md](baseline-language-roadmap.md) §14.
 
@@ -1894,13 +1894,13 @@ export fn Option.map<T, U>(opt: Option<T>, f: T -> U) -> Option<U>
 export fn Option.and_then<T, U>(opt: Option<T>, f: T -> Option<U>) -> Option<U>
 export fn Option.unwrap<T>(opt: Option<T>) -> T
 export fn Option.unwrap_or<T>(opt: Option<T>, default: T) -> T
-export fn Option.ok_or<T, E>(opt: Option<T>, err: E) -> Result<T, E>  // [PLANNED]
+export fn Option.ok_or<T, E>(opt: Option<T>, err: E) -> Result<T, E>  // [IMPLEMENTED]
 
 // Result
 export type Result<T, E> = Ok(T) | Err(E)
 export fn Result.map<T, U, E>(res: Result<T, E>, f: T -> U) -> Result<U, E>
-export fn Result.map_err<T, E, F>(res: Result<T, E>, f: E -> F) -> Result<T, F>  // [PLANNED]
-export fn Result.and_then<T, U, E>(res: Result<T, E>, f: T -> Result<U, E>) -> Result<U, E>  // [PLANNED]
+export fn Result.map_err<T, E, F>(res: Result<T, E>, f: E -> F) -> Result<T, F>  // [IMPLEMENTED]
+export fn Result.and_then<T, U, E>(res: Result<T, E>, f: T -> Result<U, E>) -> Result<U, E>  // [IMPLEMENTED]
 export fn Result.unwrap<T, E>(res: Result<T, E>) -> T
 export fn Result.unwrap_or<T, E>(res: Result<T, E>, default: T) -> T
 ```
@@ -1912,7 +1912,7 @@ module Baseline.Collections
 
 // List
 export fn List.length<T>(list: List<T>) -> Int          // [IMPLEMENTED]
-export fn List.get<T>(list: List<T>, index: Int) -> T?   // [PLANNED]
+export fn List.get<T>(list: List<T>, index: Int) -> T?   // [IMPLEMENTED]
 export fn List.head<T>(list: List<T>) -> T?              // [IMPLEMENTED]
 export fn List.tail<T>(list: List<T>) -> List<T>         // [IMPLEMENTED]
 export fn List.map<T, U>(list: List<T>, f: T -> U) -> List<U>     // [IMPLEMENTED]
@@ -1961,7 +1961,7 @@ export fn String.contains(s: String, sub: String) -> Bool          // [IMPLEMENT
 export fn String.replace(s: String, from: String, to: String) -> String  // [IMPLEMENTED]
 export fn String.to_upper(s: String) -> String                     // [IMPLEMENTED]
 export fn String.to_lower(s: String) -> String                     // [IMPLEMENTED]
-export fn String.matches(s: String, re: Regex) -> Bool             // [PLANNED]
+export fn String.matches(s: String, pattern: String) -> Bool        // [IMPLEMENTED — pattern is a regex string]
 
 export type Regex                                                   // [PLANNED]
 export fn Regex.new(pattern: String) -> Result<Regex, RegexError>  // [PLANNED]
@@ -1974,7 +1974,7 @@ export fn Regex.captures(re: Regex, s: String) -> List<String>?    // [PLANNED]
 The standard library provides a toolkit optimized for web and database workflows:
 - **Core:** `Console`, `Env`, `Fs`, `Math`, `Random`, `DateTime`, `Time`. [IMPLEMENTED]
 - **Data:** `List`, `Map`, `Set`, `String`, `Json`. [IMPLEMENTED] `Regex` is [PLANNED].
-- **Web:** `Crypto`, `HttpError`, `Router`, `Request`, `Response`, `Middleware`, `Ws` (WebSockets). [IMPLEMENTED] `Jwt`, `Session`, `Multipart` are [PLANNED].
+- **Web:** `Crypto`, `HttpError`, `Router`, `Request`, `Response`, `Middleware`, `Ws` (WebSockets), `Jwt`, `Session`, `Validate`, `Multipart` (via `Request.multipart`). [IMPLEMENTED]
 - **Db:** `Sql`, `Sqlite`, `Mysql`, `Postgres` with connections, migrations, schemas. [IMPLEMENTED]
 - **Other:** `Int`, `Float`, `Option`, `Result`, `Log`, `Metrics`, `Http`, `Server`, `Scope`, `Async`. [IMPLEMENTED or PARTIAL]
 
