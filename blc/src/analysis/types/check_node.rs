@@ -1479,6 +1479,14 @@ fn check_node_inner(
 
             let obj_type = check_node(&obj_node, source, file, symbols, diagnostics);
 
+            // Store object type at end_byte + 1 (unique key that won't collide
+            // with any CST node's start_byte or end_byte).
+            if matches!(&obj_type, Type::Struct(_, _) | Type::Record(_, None)) {
+                symbols
+                    .type_map
+                    .insert(node.end_byte() + 1, obj_type.clone());
+            }
+
             match obj_type {
                 Type::Struct(name, fields) => {
                     if let Some(ty) = fields.get(field_name) {

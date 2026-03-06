@@ -464,6 +464,8 @@ pub extern "C" fn jit_make_record_reuse(reuse_bits: u64, pairs: *const u64, coun
         };
         fields.push((key, val_nv));
     }
+    // Sort fields alphabetically for O(1) indexed access.
+    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
     let new_obj = HeapObject::Record(fields);
     let ptr = (reuse_bits & PAYLOAD_MASK) as *mut HeapObject;
     unsafe { std::ptr::write(ptr, new_obj) };
@@ -540,8 +542,8 @@ pub extern "C" fn jit_make_record(pairs: *const u64, count: u64) -> u64 {
         };
         fields.push((key, val_nv));
     }
-    let result = NValue::record(fields);
-    jit_own(result)
+    // NValue::record sorts fields alphabetically for O(1) indexed access.
+    jit_own(NValue::record(fields))
 }
 
 /// Build a named struct from interleaved key/value pairs.
@@ -564,8 +566,8 @@ pub extern "C" fn jit_make_struct(name_bits: u64, pairs: *const u64, count: u64)
         };
         fields.push((key, val_nv));
     }
-    let result = NValue::struct_val(name, fields);
-    jit_own(result)
+    // NValue::struct_val sorts fields alphabetically for O(1) indexed access.
+    jit_own(NValue::struct_val(name, fields))
 }
 
 /// Get a field from a record or struct by field name.
@@ -579,18 +581,14 @@ pub extern "C" fn jit_get_field(object_bits: u64, field_bits: u64) -> u64 {
     };
 
     let result = if let Some(fields) = obj.as_record() {
-        fields
-            .iter()
-            .find(|(k, _)| **k == **field_name)
-            .map(|(_, v)| v.clone())
-            .unwrap_or(NValue::unit())
+        find_field_index(fields, field_name)
+            .map(|idx| fields[idx].1.clone())
+            .unwrap_or_else(NValue::unit)
     } else if obj.is_heap() {
         match obj.as_heap_ref() {
-            HeapObject::Struct { fields, .. } => fields
-                .iter()
-                .find(|(k, _)| **k == **field_name)
-                .map(|(_, v)| v.clone())
-                .unwrap_or(NValue::unit()),
+            HeapObject::Struct { fields, .. } => find_field_index(fields, field_name)
+                .map(|idx| fields[idx].1.clone())
+                .unwrap_or_else(NValue::unit),
             _ => NValue::unit(),
         }
     } else {
@@ -600,10 +598,68 @@ pub extern "C" fn jit_get_field(object_bits: u64, field_bits: u64) -> u64 {
     jit_own(result)
 }
 
+/// Get a field by compile-time index (O(1) access, no string comparison).
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_get_field_idx(object_bits: u64, idx: u64) -> u64 {
+    let obj = unsafe { NValue::borrow_from_raw(object_bits) };
+    let i = idx as usize;
+    let result = if let Some(fields) = obj.as_record() {
+        fields.get(i).map(|(_, v)| v.clone()).unwrap_or_else(NValue::unit)
+    } else if obj.is_heap() {
+        match obj.as_heap_ref() {
+            HeapObject::Struct { fields, .. } => {
+                fields.get(i).map(|(_, v)| v.clone()).unwrap_or_else(NValue::unit)
+            }
+            _ => NValue::unit(),
+        }
+    } else {
+        NValue::unit()
+    };
+    jit_own(result)
+}
+
+#[inline]
+fn find_field_index(fields: &[(RcStr, NValue)], key: &RcStr) -> Option<usize> {
+    fields
+        .iter()
+        .position(|(k, _)| rc::ptr_eq(k, key) || **k == **key)
+}
+
+#[inline]
+fn apply_record_updates(
+    fields: &mut Vec<(RcStr, NValue)>,
+    updates: &[u64],
+    count: usize,
+    borrow_keys: bool,
+    allow_new_fields: bool,
+) -> Result<(), String> {
+    for i in 0..count {
+        let key_nv = if borrow_keys {
+            unsafe { NValue::borrow_from_raw(updates[i * 2]) }
+        } else {
+            unsafe { jit_take_arg(updates[i * 2]) }
+        };
+        let val_nv = unsafe { jit_take_arg(updates[i * 2 + 1]) };
+        let Some(key_ref) = key_nv.as_string() else {
+            return Err("record update key must be a string".to_string());
+        };
+        if let Some(idx) = find_field_index(fields, key_ref) {
+            fields[idx].1 = val_nv;
+        } else if allow_new_fields {
+            // Insert in sorted position to maintain alphabetical field order.
+            let pos = fields.partition_point(|(k, _)| k.as_ref() < key_ref.as_ref());
+            fields.insert(pos, (key_ref.clone(), val_nv));
+        } else {
+            return Err(format!("Record has no field '{}'", key_ref));
+        }
+    }
+    Ok(())
+}
+
 /// Update a record or named struct by merging in new fields.
 #[unsafe(no_mangle)]
 pub extern "C" fn jit_update_record(base_bits: u64, updates: *const u64, count: u64) -> u64 {
-    let base = unsafe { jit_take_arg(base_bits) };
+    let mut base = unsafe { jit_take_arg(base_bits) };
     let n = count as usize;
     let slice = unsafe { std::slice::from_raw_parts(updates, n * 2) };
 
@@ -612,20 +668,140 @@ pub extern "C" fn jit_update_record(base_bits: u64, updates: *const u64, count: 
         return NV_UNIT;
     }
 
+    // Fast path: unique ownership allows in-place update.
+    if let Some(obj) = base.as_heap_mut() {
+        let updated = match obj {
+            HeapObject::Record(fields) => apply_record_updates(fields, slice, n, false, true),
+            HeapObject::Struct { fields, .. } => apply_record_updates(fields, slice, n, false, false),
+            _ => Err("update_record on non-record".to_string()),
+        };
+        match updated {
+            Ok(()) => return jit_own(base),
+            Err(msg) => {
+                jit_set_error(msg);
+                return NV_UNIT;
+            }
+        }
+    }
+
+    // Slow path: clone fields, apply updates.
+    match base.as_heap_ref() {
+        HeapObject::Record(base_fields) => {
+            let mut fields: Vec<(RcStr, NValue)> = base_fields.clone();
+            if let Err(msg) = apply_record_updates(&mut fields, slice, n, false, true) {
+                jit_set_error(msg);
+                return NV_UNIT;
+            }
+            jit_own(NValue::record(fields))
+        }
+        HeapObject::Struct { name, fields: base_fields } => {
+            let mut fields: Vec<(RcStr, NValue)> = base_fields.clone();
+            if let Err(msg) = apply_record_updates(&mut fields, slice, n, false, false) {
+                jit_set_error(msg);
+                return NV_UNIT;
+            }
+            jit_own(NValue::struct_val(name.clone(), fields))
+        }
+        _ => {
+            jit_set_error("update_record on non-record".to_string());
+            NV_UNIT
+        }
+    }
+}
+
+/// Update record with borrowed keys (JIT fast path avoiding key allocation).
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_update_record_borrow_keys(base_bits: u64, updates: *const u64, count: u64) -> u64 {
+    let mut base = unsafe { jit_take_arg(base_bits) };
+    let n = count as usize;
+    let slice = unsafe { std::slice::from_raw_parts(updates, n * 2) };
+
+    if !base.is_heap() {
+        jit_set_error("update_record on non-record".to_string());
+        return NV_UNIT;
+    }
+
+    // Fast path: unique ownership allows in-place update.
+    if let Some(obj) = base.as_heap_mut() {
+        let updated = match obj {
+            HeapObject::Record(fields) => apply_record_updates(fields, slice, n, true, true),
+            HeapObject::Struct { fields, .. } => apply_record_updates(fields, slice, n, true, false),
+            _ => Err("update_record on non-record".to_string()),
+        };
+        match updated {
+            Ok(()) => return jit_own(base),
+            Err(msg) => {
+                jit_set_error(msg);
+                return NV_UNIT;
+            }
+        }
+    }
+
+    match base.as_heap_ref() {
+        HeapObject::Record(base_fields) => {
+            let mut fields: Vec<(RcStr, NValue)> = base_fields.clone();
+            if let Err(msg) = apply_record_updates(&mut fields, slice, n, true, true) {
+                jit_set_error(msg);
+                return NV_UNIT;
+            }
+            jit_own(NValue::record(fields))
+        }
+        HeapObject::Struct { name, fields: base_fields } => {
+            let mut fields: Vec<(RcStr, NValue)> = base_fields.clone();
+            if let Err(msg) = apply_record_updates(&mut fields, slice, n, true, false) {
+                jit_set_error(msg);
+                return NV_UNIT;
+            }
+            jit_own(NValue::struct_val(name.clone(), fields))
+        }
+        _ => {
+            jit_set_error("update_record on non-record".to_string());
+            NV_UNIT
+        }
+    }
+}
+
+/// Update record by integer field indices (no string comparison).
+/// Updates is interleaved [idx0, val0, idx1, val1, ...].
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_update_record_indexed(base_bits: u64, updates: *const u64, count: u64) -> u64 {
+    let mut base = unsafe { jit_take_arg(base_bits) };
+    let n = count as usize;
+    let slice = unsafe { std::slice::from_raw_parts(updates, n * 2) };
+
+    if !base.is_heap() {
+        jit_set_error("update_record on non-record".to_string());
+        return NV_UNIT;
+    }
+
+    // Fast path: unique ownership allows in-place update.
+    if let Some(obj) = base.as_heap_mut() {
+        let fields = match obj {
+            HeapObject::Record(fields) | HeapObject::Struct { fields, .. } => fields,
+            _ => {
+                jit_set_error("update_record on non-record".to_string());
+                return NV_UNIT;
+            }
+        };
+        for i in 0..n {
+            let idx = slice[i * 2] as usize;
+            let val_nv = unsafe { jit_take_arg(slice[i * 2 + 1]) };
+            if idx < fields.len() {
+                fields[idx].1 = val_nv;
+            }
+        }
+        return jit_own(base);
+    }
+
+    // Slow path: clone fields, apply indexed updates.
     match base.as_heap_ref() {
         HeapObject::Record(base_fields) => {
             let mut fields: Vec<(RcStr, NValue)> = base_fields.clone();
             for i in 0..n {
-                let key_nv = unsafe { jit_take_arg(slice[i * 2]) };
+                let idx = slice[i * 2] as usize;
                 let val_nv = unsafe { jit_take_arg(slice[i * 2 + 1]) };
-                let Some(key) = key_nv.as_string().cloned() else {
-                    jit_set_error("record update key must be a string".to_string());
-                    return NV_UNIT;
-                };
-                if let Some(existing) = fields.iter_mut().find(|(k, _)| *k == key) {
-                    existing.1 = val_nv;
-                } else {
-                    fields.push((key, val_nv));
+                if idx < fields.len() {
+                    fields[idx].1 = val_nv;
                 }
             }
             jit_own(NValue::record(fields))
@@ -633,17 +809,10 @@ pub extern "C" fn jit_update_record(base_bits: u64, updates: *const u64, count: 
         HeapObject::Struct { name, fields: base_fields } => {
             let mut fields: Vec<(RcStr, NValue)> = base_fields.clone();
             for i in 0..n {
-                let key_nv = unsafe { jit_take_arg(slice[i * 2]) };
+                let idx = slice[i * 2] as usize;
                 let val_nv = unsafe { jit_take_arg(slice[i * 2 + 1]) };
-                let Some(key) = key_nv.as_string().cloned() else {
-                    jit_set_error("record update key must be a string".to_string());
-                    return NV_UNIT;
-                };
-                if let Some(existing) = fields.iter_mut().find(|(k, _)| *k == key) {
-                    existing.1 = val_nv;
-                } else {
-                    jit_set_error(format!("Record has no field '{}'", key));
-                    return NV_UNIT;
+                if idx < fields.len() {
+                    fields[idx].1 = val_nv;
                 }
             }
             jit_own(NValue::struct_val(name.clone(), fields))

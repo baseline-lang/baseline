@@ -107,6 +107,11 @@ fn optimize_inner(module: &mut IrModule, lift: bool) {
         func.body = eliminate_dead_lets(func.body.clone());
         func.body = simplify_blocks(func.body.clone());
     }
+    // Tuple-let fusion (after simplify_blocks flattens inlined bodies)
+    for func in &mut module.functions {
+        func.body = fuse_tuple_lets(func.body.clone());
+        func.body = simplify_blocks(func.body.clone());
+    }
     // Final: propagation + folding again (to fold across simplified blocks)
     for func in &mut module.functions {
         func.body = propagate_and_fold(func.body.clone());
@@ -1919,14 +1924,43 @@ fn try_fold_unaryop(op: UnaryOp, operand: &Expr) -> Option<Expr> {
 /// Maximum node count for a function body to be considered for inlining.
 const INLINE_THRESHOLD: usize = 30;
 
+/// Higher inline threshold for lightweight functions (only arithmetic + record ops,
+/// no closures, effects, or list construction).
+const INLINE_THRESHOLD_LARGE: usize = 120;
+
 /// Maximum number of inlining iterations to handle chains (f calls g calls h).
-const INLINE_MAX_ROUNDS: usize = 3;
+const INLINE_MAX_ROUNDS: usize = 4;
 
 /// Count the number of AST nodes in an expression (for inlining budget).
 fn expr_node_count(expr: &Expr) -> usize {
     let mut count = 0;
     visit_expr(expr, &mut |_| count += 1);
     count
+}
+
+/// Returns true if a function body contains only lightweight operations
+/// (arithmetic, records, fields, control flow, direct calls). No closures,
+/// effects, lists, or dynamic dispatch.
+fn is_lightweight(expr: &Expr) -> bool {
+    let mut lightweight = true;
+    visit_expr(expr, &mut |e| {
+        if !lightweight { return; }
+        match e {
+            Expr::Int(_) | Expr::Float(_) | Expr::String(_) | Expr::Bool(_)
+            | Expr::Unit | Expr::Var(_, _)
+            | Expr::BinOp { .. } | Expr::UnaryOp { .. }
+            | Expr::And(_, _) | Expr::Or(_, _)
+            | Expr::GetField { .. } | Expr::MakeRecord(_, _) | Expr::MakeStruct { .. }
+            | Expr::UpdateRecord { .. }
+            | Expr::MakeTuple(_, _) | Expr::MakeRange(_, _)
+            | Expr::Let { .. } | Expr::Block(_, _)
+            | Expr::If { .. } | Expr::Match { .. }
+            | Expr::CallDirect { .. } | Expr::TailCall { .. }
+            | Expr::CallNative { .. } => {}
+            _ => { lightweight = false; }
+        }
+    });
+    lightweight
 }
 
 /// Check if an expression contains a call (direct or tail) to the named function.
@@ -1990,6 +2024,19 @@ fn rename_pattern(pattern: Pattern, rename_map: &HashMap<String, String>) -> Pat
                 Pattern::Var(name)
             }
         }
+        Pattern::Tuple(pats) => {
+            Pattern::Tuple(pats.into_iter().map(|p| rename_pattern(p, rename_map)).collect())
+        }
+        Pattern::Constructor(tag, pats) => {
+            Pattern::Constructor(tag, pats.into_iter().map(|p| rename_pattern(p, rename_map)).collect())
+        }
+        Pattern::Record(fields) => {
+            Pattern::Record(fields.into_iter().map(|(k, p)| (k, rename_pattern(p, rename_map))).collect())
+        }
+        Pattern::List(pats, rest) => {
+            let rest = rest.map(|r| rename_map.get(&r).cloned().unwrap_or(r));
+            Pattern::List(pats.into_iter().map(|p| rename_pattern(p, rename_map)).collect(), rest)
+        }
         other => other,
     }
 }
@@ -2025,7 +2072,12 @@ fn inline_functions(module: &mut IrModule) {
         .iter()
         .filter(|f| {
             let size = expr_node_count(&f.body);
-            size <= INLINE_THRESHOLD && !references_function(&f.body, &f.name) && !has_early_return(&f.body)
+            let threshold = if is_lightweight(&f.body) {
+                INLINE_THRESHOLD_LARGE
+            } else {
+                INLINE_THRESHOLD
+            };
+            size <= threshold && !references_function(&f.body, &f.name) && !has_early_return(&f.body)
         })
         .map(|f| (f.name.clone(), (f.params.clone(), f.body.clone())))
         .collect();
@@ -2098,6 +2150,48 @@ fn exprs_equal(a: &Expr, b: &Expr) -> bool {
 // ---------------------------------------------------------------------------
 // Pass 4: Block simplification
 // ---------------------------------------------------------------------------
+
+/// Fuse `let (a, b, ...) = (x, y, ...)` into individual let bindings.
+/// Also handles `let (a, b) = { ..stmts; (x, y) }` by extracting stmts
+/// and binding each element directly, eliminating the intermediate tuple.
+fn fuse_tuple_lets(expr: Expr) -> Expr {
+    transform_expr(expr, &mut |e| {
+        if let Expr::Let { ref pattern, ref value, .. } = e {
+            if let Pattern::Tuple(ref pats) = **pattern {
+                if let Expr::MakeTuple(ref elems, _) = **value {
+                    if pats.len() == elems.len() {
+                        let bindings: Vec<Expr> = pats.iter().zip(elems.iter())
+                            .map(|(p, v)| Expr::Let {
+                                pattern: Box::new(p.clone()),
+                                value: Box::new(v.clone()),
+                                ty: None,
+                            })
+                            .collect();
+                        return if bindings.len() == 1 {
+                            bindings.into_iter().next().unwrap()
+                        } else {
+                            Expr::Block(bindings, None)
+                        };
+                    }
+                }
+                if let Expr::Block(ref exprs, _) = **value {
+                    if let Some(Expr::MakeTuple(elems, _)) = exprs.last() {
+                        if pats.len() == elems.len() {
+                            let mut stmts: Vec<Expr> = exprs[..exprs.len() - 1].to_vec();
+                            stmts.extend(pats.iter().zip(elems.iter()).map(|(p, v)| Expr::Let {
+                                pattern: Box::new(p.clone()),
+                                value: Box::new(v.clone()),
+                                ty: None,
+                            }));
+                            return Expr::Block(stmts, None);
+                        }
+                    }
+                }
+            }
+        }
+        e
+    })
+}
 
 /// Simplify blocks: remove non-final Unit expressions, flatten nested blocks,
 /// unwrap single-element blocks.

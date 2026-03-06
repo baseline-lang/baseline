@@ -45,6 +45,12 @@ pub unsafe fn increment_strong_count<T: ?Sized>(ptr: *const T) {
     }
 }
 
+/// Compare two Rc pointers for identity (same allocation).
+#[inline(always)]
+pub fn ptr_eq<T: ?Sized>(a: &Rc<T>, b: &Rc<T>) -> bool {
+    Rc::ptr_eq(a, b)
+}
+
 /// Decrement the strong count of a raw pointer (mirrors Arc/Rc API).
 ///
 /// # Safety

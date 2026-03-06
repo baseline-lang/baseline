@@ -79,6 +79,17 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         self.builder.use_var(var)
     }
 
+    /// Compute sorted field index for a field name given a record/struct type.
+    fn sorted_field_index(ty: &Type, field_name: &str) -> Option<u16> {
+        let fields = match ty {
+            Type::Struct(_, fields) | Type::Record(fields, _) => fields,
+            _ => return None,
+        };
+        let mut names: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+        names.sort();
+        names.iter().position(|&n| n == field_name).map(|i| i as u16)
+    }
+
     /// Compile a slice of expressions, stashing each intermediate result
     /// in a Variable to prevent SSA dominance violations when later
     /// compile_expr calls create new blocks (if/else, match, etc.).
@@ -1503,31 +1514,64 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 Ok(self.call_helper("jit_make_range", &[start_val, end_val]))
             }
 
-            Expr::UpdateRecord { base, updates, .. } => {
+            Expr::UpdateRecord { base, updates, ty, .. } => {
+                // Indexed path: if we know the base type, resolve field indices.
+                let indices: Option<Vec<u16>> = ty.as_ref().and_then(|t| {
+                    updates.iter()
+                        .map(|(fname, _)| Self::sorted_field_index(t, fname))
+                        .collect()
+                });
+
                 let base_val = self.compile_expr(base)?;
                 let base_val = self.stash_in_var(base_val);
 
-                let mut pair_vals = Vec::with_capacity(updates.len() * 2);
-                for (fname, fexpr) in updates {
-                    let key_val = self.emit_string_value(fname)?;
-                    let key_val = self.stash_in_var(key_val);
-                    let val = self.compile_expr(fexpr)?;
-                    pair_vals.push(key_val);
-                    pair_vals.push(val);
+                if let Some(ref idxs) = indices {
+                    let mut pair_vals = Vec::with_capacity(updates.len() * 2);
+                    for (i, (_, fexpr)) in updates.iter().enumerate() {
+                        let idx_val = self.builder.ins().iconst(types::I64, idxs[i] as i64);
+                        let idx_val = self.stash_in_var(idx_val);
+                        let val = self.compile_expr(fexpr)?;
+                        pair_vals.push(idx_val);
+                        pair_vals.push(val);
+                    }
+                    let addr = self.spill_to_stack(&pair_vals);
+                    let count = self.builder.ins().iconst(types::I64, updates.len() as i64);
+                    Ok(self.call_helper("jit_update_record_indexed", &[base_val, addr, count]))
+                } else {
+                    // Fallback: string-based update
+                    let mut pair_vals = Vec::with_capacity(updates.len() * 2);
+                    for (fname, fexpr) in updates {
+                        let key_val = self.emit_string_value(fname)?;
+                        let key_val = self.stash_in_var(key_val);
+                        let val = self.compile_expr(fexpr)?;
+                        pair_vals.push(key_val);
+                        pair_vals.push(val);
+                    }
+                    let addr = self.spill_to_stack(&pair_vals);
+                    let count = self.builder.ins().iconst(types::I64, updates.len() as i64);
+                    Ok(self.call_helper("jit_update_record", &[base_val, addr, count]))
                 }
-
-                let addr = self.spill_to_stack(&pair_vals);
-                let count = self.builder.ins().iconst(types::I64, updates.len() as i64);
-                Ok(self.call_helper("jit_update_record", &[base_val, addr, count]))
             }
 
-            Expr::GetField { object, field, .. } => {
+            Expr::GetField { object, field, field_idx, .. } => {
                 // SRA: if object is a scalar-replaced record, read field variable directly
                 if let Expr::Var(name, _) = object.as_ref()
                     && let Some(field_vars) = self.sra_records.get(name.as_str())
                         && let Some(&var) = field_vars.get(field.as_str()) {
                             return Ok(self.builder.use_var(var));
                         }
+                // Indexed fast path: O(1) field access by compile-time index.
+                if let Some(idx) = field_idx {
+                    let obj_val = self.compile_expr(object)?;
+                    let idx_val = self.builder.ins().iconst(types::I64, *idx as i64);
+                    let result = self.call_helper("jit_get_field_idx", &[obj_val, idx_val]);
+                    if self.rc_enabled {
+                        self.emit_decref(obj_val);
+                    }
+                    return Ok(result);
+                }
+                // JIT fast path: borrow object variable.
+                // (String-based GetField fallback when no field_idx available)
                 let obj_val = self.compile_expr(object)?;
                 let field_val = self.emit_string_value(field)?;
                 let result = self.call_helper("jit_get_field", &[obj_val, field_val]);

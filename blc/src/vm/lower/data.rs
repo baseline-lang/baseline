@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use tree_sitter::Node;
 
+use crate::analysis::types::Type;
 use crate::vm::ir::CompileError;
 use crate::vm::ir::*;
 
@@ -206,10 +207,21 @@ impl<'a> super::Lowerer<'a> {
             .as_ref()
             .and_then(|tm| tm.get(&node.start_byte()).cloned());
 
+        // Resolve compile-time field index from the object's type.
+        // Object type stored at end_byte + 1 by the type checker to avoid
+        // collision with the field_expression result type at start_byte.
+        let obj_ty = self
+            .type_map
+            .as_ref()
+            .and_then(|tm| tm.get(&(node.end_byte() + 1)).cloned());
+        let field_idx = obj_ty
+            .as_ref()
+            .and_then(|t| compute_sorted_field_index(t, &field_name));
+
         Ok(Expr::GetField {
             object: Box::new(object),
             field: field_name,
-            field_idx: None,
+            field_idx,
             ty,
         })
     }
@@ -300,10 +312,40 @@ impl<'a> super::Lowerer<'a> {
 
         self.tail_position = was_tail;
 
+        // Look up the base type for indexed update in JIT.
+        let ty = self
+            .type_map
+            .as_ref()
+            .and_then(|tm| tm.get(&children[0].start_byte()).cloned());
+
         Ok(Expr::UpdateRecord {
             base: Box::new(base),
             updates,
-            ty: None,
+            ty,
         })
     }
+}
+
+/// Compute a field's index in alphabetically sorted field names.
+/// Returns None if the type doesn't have named fields or the field is missing.
+fn compute_sorted_field_index(ty: &Type, field_name: &str) -> Option<u16> {
+    let field_names: Vec<&str> = match ty {
+        Type::Struct(_, fields) => {
+            let mut names: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+            names.sort();
+            names
+        }
+        // Only closed records (no row variable) can use indexed access.
+        // Open records may have extra fields at runtime that change the index.
+        Type::Record(fields, None) => {
+            let mut names: Vec<&str> = fields.keys().map(|s| s.as_str()).collect();
+            names.sort();
+            names
+        }
+        _ => return None,
+    };
+    field_names
+        .iter()
+        .position(|&n| n == field_name)
+        .map(|i| i as u16)
 }

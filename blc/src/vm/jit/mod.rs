@@ -245,7 +245,10 @@ const HELPER_SYMBOLS: &[(&str, *const u8)] = &[
     ("jit_make_record", jit_make_record as *const u8),
     ("jit_make_struct", jit_make_struct as *const u8),
     ("jit_get_field", jit_get_field as *const u8),
+    ("jit_get_field_idx", jit_get_field_idx as *const u8),
     ("jit_update_record", jit_update_record as *const u8),
+    ("jit_update_record_borrow_keys", jit_update_record_borrow_keys as *const u8),
+    ("jit_update_record_indexed", jit_update_record_indexed as *const u8),
     ("jit_make_range", jit_make_range as *const u8),
     ("jit_enum_tag_eq", jit_enum_tag_eq as *const u8),
     ("jit_enum_tag_id", jit_enum_tag_id as *const u8),
@@ -818,7 +821,8 @@ pub(super) fn make_helper_sig<M: Module>(
             sig.params.push(AbiParam::new(types::I64));
             sig.returns.push(AbiParam::new(types::I64));
         }
-        "jit_make_enum" | "jit_make_range" | "jit_get_field" | "jit_enum_tag_eq"
+        "jit_make_enum" | "jit_make_range" | "jit_get_field" | "jit_get_field_idx"
+        | "jit_enum_tag_eq"
         | "jit_values_equal" | "jit_list_get" | "jit_enum_field_get" => {
             // (a, b) -> u64
             sig.params.push(AbiParam::new(types::I64));
@@ -851,7 +855,7 @@ pub(super) fn make_helper_sig<M: Module>(
             sig.params.push(AbiParam::new(types::I64));
             sig.params.push(AbiParam::new(types::I64));
         }
-        "jit_update_record" => {
+        "jit_update_record" | "jit_update_record_borrow_keys" | "jit_update_record_indexed" => {
             // (base, updates_ptr, count) -> u64
             sig.params.push(AbiParam::new(types::I64));
             sig.params.push(AbiParam::new(ptr_type));

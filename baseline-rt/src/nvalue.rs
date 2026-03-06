@@ -392,7 +392,9 @@ impl NValue {
         Self::from_heap(HeapObject::List(items))
     }
 
-    pub fn record(fields: Vec<(RcStr, NValue)>) -> Self {
+    pub fn record(mut fields: Vec<(RcStr, NValue)>) -> Self {
+        // Sort fields alphabetically for consistent O(1) indexed access.
+        fields.sort_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
         Self::from_heap(HeapObject::Record(fields))
     }
 
@@ -446,7 +448,9 @@ impl NValue {
         })
     }
 
-    pub fn struct_val(name: RcStr, fields: Vec<(RcStr, NValue)>) -> Self {
+    pub fn struct_val(name: RcStr, mut fields: Vec<(RcStr, NValue)>) -> Self {
+        // Sort fields alphabetically for consistent O(1) indexed access.
+        fields.sort_by(|(a, _), (b, _)| a.as_ref().cmp(b.as_ref()));
         Self::from_heap(HeapObject::Struct { name, fields })
     }
 
