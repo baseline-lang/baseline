@@ -490,7 +490,7 @@ pub(super) fn compute_unboxed_flags(module: &IrModule) -> Vec<bool> {
         .map(|(i, f)| {
             i != module.entry
                 && is_scalar_only(f)
-                && matches!(f.ty, Some(Type::Int))
+                && !matches!(f.ty, Some(Type::Bool | Type::Float))
                 && !f.name.starts_with("__lambda_")
                 && !indirect_targets.contains(&f.name)
         })
