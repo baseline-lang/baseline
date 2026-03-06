@@ -15,6 +15,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::rc::{self, Rc};
+use im::HashMap as ImHashMap;
 use rustc_hash::FxBuildHasher;
 
 use crate::value::{RcStr, Value};
@@ -35,7 +36,7 @@ pub enum SqlValue {
 
 /// Shared column names across all rows from a single query.
 pub type ColumnNames = Rc<Vec<RcStr>>;
-pub type MapStore = std::collections::HashMap<NValue, NValue, FxBuildHasher>;
+pub type MapStore = ImHashMap<NValue, NValue, FxBuildHasher>;
 
 // ---------------------------------------------------------------------------
 // Tag constants

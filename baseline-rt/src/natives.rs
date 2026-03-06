@@ -809,7 +809,7 @@ pub extern "C" fn bl_map_from_list(args: *const u64, count: u64) -> u64 {
     let vals = args_from_raw(args, count);
     match vals[0].as_list() {
         Some(items) => {
-            let mut entries = MapStore::with_capacity_and_hasher(items.len(), Default::default());
+            let mut entries = MapStore::default();
             for item in items {
                 if let Some(tuple) = item.as_tuple() {
                     if tuple.len() >= 2 {

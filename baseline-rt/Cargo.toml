@@ -13,6 +13,7 @@ default = []
 non-atomic-rc = []
 
 [dependencies]
+im = "15"
 libc = "0.2"
 rustc-hash = "2"
 

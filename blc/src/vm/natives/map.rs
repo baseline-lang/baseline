@@ -20,8 +20,8 @@ pub(super) fn native_map_insert(args: &[NValue]) -> Result<NValue, NativeError> 
 }
 
 /// Owning CoW variant of Map.insert. When the map is uniquely owned
-/// (Arc refcount == 1), mutates the HashMap in-place (O(1) amortized).
-/// Otherwise falls back to clone (O(n)).
+/// (Arc refcount == 1), mutates the map in-place.
+/// Otherwise falls back to a cloned/structurally-shared map update.
 pub(super) fn native_map_insert_owning(args: Vec<NValue>) -> Result<NValue, NativeError> {
     let mut args = args;
     let val = args.pop().unwrap();
@@ -76,7 +76,7 @@ pub(super) fn native_map_remove(args: &[NValue]) -> Result<NValue, NativeError> 
 }
 
 /// Owning CoW variant of Map.remove. When the map is uniquely owned,
-/// removes the key in-place (O(1)). Otherwise falls back to clone.
+/// removes the key in-place. Otherwise falls back to cloned/shared update.
 pub(super) fn native_map_remove_owning(args: Vec<NValue>) -> Result<NValue, NativeError> {
     let mut args = args;
     let key = args.pop().unwrap();
@@ -127,7 +127,7 @@ pub(super) fn native_map_keys_owning(args: Vec<NValue>) -> Result<NValue, Native
     let map_val = args.into_iter().next().unwrap();
     match map_val.try_unwrap_heap() {
         Ok(HeapObject::Map(entries)) => {
-            let keys: Vec<_> = entries.into_keys().collect();
+            let keys: Vec<_> = entries.into_iter().map(|(k, _)| k).collect();
             Ok(NValue::list(keys))
         }
         Ok(_) => Err(NativeError("Map.keys: expected Map".into())),
@@ -157,7 +157,7 @@ pub(super) fn native_map_values_owning(args: Vec<NValue>) -> Result<NValue, Nati
     let map_val = args.into_iter().next().unwrap();
     match map_val.try_unwrap_heap() {
         Ok(HeapObject::Map(entries)) => {
-            let vals: Vec<_> = entries.into_values().collect();
+            let vals: Vec<_> = entries.into_iter().map(|(_, v)| v).collect();
             Ok(NValue::list(vals))
         }
         Ok(_) => Err(NativeError("Map.values: expected Map".into())),
@@ -220,7 +220,7 @@ pub(super) fn native_map_entries_owning(args: Vec<NValue>) -> Result<NValue, Nat
 pub(super) fn native_map_from_list(args: &[NValue]) -> Result<NValue, NativeError> {
     match args[0].as_list() {
         Some(items) => {
-            let mut entries = MapStore::with_capacity_and_hasher(items.len(), Default::default());
+            let mut entries = MapStore::default();
             for item in items {
                 if let Some(tuple) = item.as_tuple() {
                     if tuple.len() >= 2 {
