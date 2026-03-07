@@ -46,11 +46,11 @@
     <meta name="description" content={data.description} />
 </svelte:head>
 
-<main id="main-content" class="api-page">
-    <div class="api-layout">
-        <article class="api-content">
-            <p class="api-breadcrumb"><a href="/api">API Reference</a> →</p>
-            <h1>{data.title}</h1>
+<main id="main-content" class="pt-[var(--site-top)] pr-8 pb-20 pl-[var(--content-left)]">
+    <div class="grid grid-cols-[1fr_14rem] gap-[var(--content-left)] items-start">
+        <article class="interior-content api-content max-w-[48em] min-w-0">
+            <p class="api-breadcrumb"><a href="/api">API Reference</a> &rarr;</p>
+            <h1 class="interior-h1 mb-5">{data.title}</h1>
             <p class="api-intro">
                 {data.description}
             </p>
@@ -139,13 +139,13 @@
                 </section>
             {/each}
 
-            <p class="guide-back">
-                <a href="/api">← All Packages</a>
+            <p class="mt-12 pt-5 border-t border-[var(--fg-faint)]">
+                <a class="text-sm text-[var(--fg-dim)] no-underline hover:text-[var(--fg)]" href="/api">&larr; All Packages</a>
             </p>
         </article>
 
-        <aside class="api-toc" aria-label="Module navigation">
-            <h2 class="api-toc-title">Modules</h2>
+        <aside class="toc-sidebar sticky top-[var(--site-top)] max-h-[calc(100vh-3.25rem)] overflow-y-auto pb-8" aria-label="Module navigation">
+            <h2 class="toc-title mb-3">Modules</h2>
             <nav>
                 <ul role="list">
                     {#each filteredModules as mod}

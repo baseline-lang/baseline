@@ -20,8 +20,8 @@
 	}
 </script>
 
-<nav class="site-nav" class:interior={!isHome} aria-label="Primary navigation">
-	<div class="nav-header">
+<nav class="sticky top-0 h-screen pt-[var(--site-top)] px-4 pb-4 border-r border-[var(--fg-faint)] flex flex-col gap-5 overflow-y-auto" aria-label="Primary navigation">
+	<div class="flex items-center justify-between">
 		<a href="/" class="wordmark" aria-label="Baseline home">Baseline</a>
 		<button
 			class="nav-toggle"
@@ -33,7 +33,7 @@
 		</button>
 	</div>
 	<div class="nav-drawer" class:open={menuOpen}>
-		<ul class="nav-links" role="list">
+		<ul class="nav-links flex flex-col gap-2 list-none" role="list">
 			<li><a href="/#start" onclick={closeMenu}>Install</a></li>
 			<li><a href="/#benefits" onclick={closeMenu}>Features</a></li>
 			<li><a href="/#examples" onclick={closeMenu}>Examples</a></li>
@@ -41,7 +41,7 @@
 			<li>
 				<a href="/guides" class:active={onGuidesSection} onclick={closeMenu}>Guides</a>
 				{#if onGuidesSection}
-					<ul class="nav-sub" role="list">
+					<ul class="nav-sub list-none m-0 pt-2 pl-3 flex flex-col gap-0.5" role="list">
 						{#each guidePages as guide}
 							<li>
 								<a
@@ -56,7 +56,7 @@
 			</li>
 			<li><a href="/api" onclick={closeMenu}>API</a></li>
 		</ul>
-		<div class="nav-footer">
+		<div class="nav-footer mt-auto flex flex-col gap-2">
 			<a
 				href="https://github.com/baseline-lang/baseline"
 				aria-label="GitHub (external site)">GitHub</a

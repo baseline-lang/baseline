@@ -13,12 +13,10 @@
 	/>
 </svelte:head>
 
-<main id="main-content" class="site-main">
-	<div class="container">
-		<Hero />
-		<GetStarted />
-		<Benefits />
-		<CodeExamples />
-		<Cta />
-	</div>
+<main id="main-content" class="pt-[var(--site-top)] px-[var(--content-left)] pb-20 min-w-0">
+	<Hero />
+	<GetStarted />
+	<Benefits />
+	<CodeExamples />
+	<Cta />
 </main>

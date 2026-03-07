@@ -3,11 +3,10 @@
 </script>
 
 <section id="examples" aria-labelledby="examples-heading">
-	<span class="overline">Code</span>
-	<h2 id="examples-heading">See it in action</h2>
-	<div class="example-set">
+	<h2 id="examples-heading">Examples</h2>
+	<div class="flex flex-col gap-[var(--sp-4)]">
 		{#each examples as example}
-			<div class="example-row">
+			<div class="grid grid-cols-2 gap-[var(--sp-5)] items-start">
 				<div class="example-text">
 					<h3>{example.title}</h3>
 					<p>{@html example.description}</p>

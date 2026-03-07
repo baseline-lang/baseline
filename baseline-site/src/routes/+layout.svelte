@@ -5,7 +5,7 @@
 	let { children } = $props();
 </script>
 
-<div class="site-layout">
+<div class="grid grid-cols-[var(--nav-width)_1fr] min-h-screen">
 	<a href="#main-content" class="skip-link">Skip to content</a>
 	<Nav />
 	{@render children()}

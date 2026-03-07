@@ -1,16 +1,15 @@
 <svelte:head>
-    <title>Guides | Baseline</title>
+    <title>Practical Guides | Baseline</title>
     <meta
         name="description"
-        content="Practical guides for building with Baseline — web servers, databases, and more."
+        content="Practical guides for building with Baseline: web servers, databases, and more."
     />
 </svelte:head>
 
-<main id="main-content" class="guide-page">
-    <div class="guide-index">
-        <span class="overline">Guides</span>
-        <h1>Practical Guides</h1>
-        <p class="guide-index-intro">
+<main id="main-content" class="pt-[var(--site-top)] pr-8 pb-20 pl-[var(--content-left)]">
+    <div class="max-w-[42em]">
+        <h1 class="interior-h1 mb-5">Practical Guides</h1>
+        <p class="text-[var(--fg-dim)] mb-5 leading-relaxed">
             Step-by-step guides for building with Baseline's official modules.
             For function-level detail, see the
             <a href="/api">API Reference</a>.

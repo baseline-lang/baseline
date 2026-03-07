@@ -1,7 +1,6 @@
 <section id="start" aria-labelledby="start-heading">
-	<span class="overline">Install</span>
-	<h2 id="start-heading">Up and running</h2>
-	<div class="install-cards">
+	<h2 id="start-heading">Install</h2>
+	<div class="grid grid-cols-3 gap-[var(--sp-3)] mt-[var(--sp-4)]">
 
 		<div class="install-card">
 			<div class="step-header">

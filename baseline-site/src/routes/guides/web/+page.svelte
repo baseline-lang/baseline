@@ -6,12 +6,11 @@
     />
 </svelte:head>
 
-<main id="main-content" class="guide-page">
-    <div class="guide-layout">
-        <article class="guide-content">
-            <span class="overline">Guide</span>
-            <h1>Web Framework</h1>
-            <p class="guide-intro">
+<main id="main-content" class="pt-[var(--site-top)] pr-8 pb-20 pl-[var(--content-left)]">
+    <div class="grid grid-cols-[1fr_14rem] gap-[var(--content-left)] items-start">
+        <article class="interior-content guide-content max-w-[48em] min-w-0">
+            <h1 class="interior-h1 mb-5">Web Framework</h1>
+            <p class="interior-intro max-w-[44rem] mb-5">
                 Baseline's web framework is a small set of modules that work
                 together: <strong>Router</strong> defines URL patterns,
                 <strong>Server</strong> runs the HTTP listener,
@@ -203,13 +202,13 @@
                     ></pre>
             </section>
 
-            <p class="guide-back">
-                <a href="/guides">← All Guides</a>
+            <p class="mt-12 pt-5 border-t border-[var(--fg-faint)]">
+                <a class="text-sm text-[var(--fg-dim)] no-underline hover:text-[var(--fg)]" href="/guides">&larr; All Guides</a>
             </p>
         </article>
 
-        <aside class="guide-toc" aria-label="Guide sections">
-            <h2 class="guide-toc-title">On this page</h2>
+        <aside class="toc-sidebar sticky top-[var(--site-top)] max-h-[calc(100vh-3.25rem)] overflow-y-auto pb-8" aria-label="Guide sections">
+            <h2 class="toc-title mb-3">On this page</h2>
             <nav>
                 <ul role="list">
                     <li><a href="#hello-world">Hello World</a></li>

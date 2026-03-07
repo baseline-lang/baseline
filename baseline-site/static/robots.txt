@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://baseline-lang.org/sitemap.xml

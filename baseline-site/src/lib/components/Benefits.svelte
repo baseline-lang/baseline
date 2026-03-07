@@ -3,14 +3,13 @@
 </script>
 
 <section id="benefits" aria-labelledby="benefits-heading">
-	<span class="overline">Features</span>
-	<h2 id="benefits-heading">Catch bugs in the compiler, not in production</h2>
+	<h2 id="benefits-heading">Features</h2>
 	<p class="section-intro">
 		Dozens of languages, decades of practice, and the same bugs keep getting
 		shipped. Type errors. No method errors. Undefined. Null is not a
 		function. Baseline's compiler rejects them before your code runs.
 	</p>
-	<div class="benefits-grid">
+	<div class="grid grid-cols-2 gap-x-[var(--sp-5)] gap-y-[var(--sp-3)]">
 		<div class="benefit">
 			<h3>No hidden side effects</h3>
 			<p>
@@ -53,10 +52,10 @@
 		</div>
 	</div>
 
-	<h3 id="more-features-heading">And more...</h3>
-	<div class="feature-grid">
+	<h3 id="more-features-heading" class="mt-[var(--sp-4)]">And more...</h3>
+	<div class="grid grid-cols-4 gap-[var(--sp-4)]">
 		{#each features as feature}
-			<div class="feature-item">
+			<div class="feature-item pt-[var(--sp-3)]">
 				<dl>
 					<dt>{feature.title}</dt>
 					<dd>{@html feature.description}</dd>
@@ -64,5 +63,5 @@
 			</div>
 		{/each}
 	</div>
-	<p class="section-cta"><a href="/api">View the complete API →</a></p>
+	<p class="text-[0.88rem] mt-[var(--sp-3)]"><a href="/api">View the complete API →</a></p>
 </section>
