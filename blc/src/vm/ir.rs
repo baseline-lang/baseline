@@ -258,6 +258,12 @@ pub enum Expr {
         name: String,
         value: Box<Expr>,
     },
+    /// Reassign a field on a mutable record: `b.field = new_value`.
+    FieldAssign {
+        object: String,
+        field: String,
+        value: Box<Expr>,
+    },
     Block(Vec<Expr>, Option<Type>),
 
     // -- Functions --

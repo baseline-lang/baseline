@@ -67,6 +67,12 @@ pub(super) struct FnCompileCtx<'a, 'b, M: Module> {
     pub(super) rc_scope_stack: Vec<Vec<Variable>>,
     /// Calling convention for Baseline functions (Tail for JIT, Fast for AOT).
     pub(super) func_call_conv: CallConv,
+    /// Multi-return: sorted field names for functions returning all-scalar records.
+    /// When set, the function uses N return registers instead of a single boxed record.
+    pub(super) multireturn_fields: Option<Vec<String>>,
+    /// Multi-return info for all functions (indexed by function index).
+    /// Used at call sites to detect multi-return callees.
+    pub(super) multireturn_info: &'a [Option<Vec<String>>],
 }
 
 pub(super) type CValue = cranelift_codegen::ir::Value;
@@ -198,7 +204,8 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
             | Expr::Expect { .. }
             | Expr::Drop { .. }
             | Expr::Reuse { .. }
-            | Expr::Assign { .. } => None,
+            | Expr::Assign { .. }
+            | Expr::FieldAssign { .. } => None,
         }
     }
 
@@ -377,7 +384,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                         .map(|a| Self::count_param_field_reads(a, param_name))
                         .sum::<usize>()
             }
-            Expr::Let { value, .. } | Expr::Assign { value, .. } => Self::count_param_field_reads(value, param_name),
+            Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => Self::count_param_field_reads(value, param_name),
             Expr::Block(exprs, _) | Expr::MakeList(exprs, _) | Expr::MakeTuple(exprs, _) => exprs
                 .iter()
                 .map(|e| Self::count_param_field_reads(e, param_name))
@@ -560,7 +567,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     Self::collect_var_types(e, params, out);
                 }
             }
-            Expr::Let { value, .. } | Expr::Assign { value, .. } => {
+            Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => {
                 Self::collect_var_types(value, params, out);
             }
             Expr::Block(exprs, _) => {
@@ -1140,6 +1147,23 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     self.builder.def_var(var, val);
                 }
                 Ok(self.builder.ins().iconst(types::I64, 0))
+            }
+
+            Expr::FieldAssign { object, field, value } => {
+                // SRA fast path
+                if let Some(field_vars) = self.sra_records.get(object.as_str()) {
+                    if let Some(&fvar) = field_vars.get(field.as_str()) {
+                        let val = self.compile_expr_unboxed(value)?;
+                        self.builder.def_var(fvar, val);
+                        return Ok(self.builder.ins().iconst(types::I64, 0));
+                    }
+                }
+                // Fall back to boxed path
+                self.compile_expr(&Expr::FieldAssign {
+                    object: object.clone(),
+                    field: field.clone(),
+                    value: value.clone(),
+                })
             }
 
             Expr::Block(exprs, _) => {
@@ -1736,6 +1760,45 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 Ok(self.builder.ins().iconst(types::I64, NV_UNIT as i64))
             }
 
+            Expr::FieldAssign { object, field, value } => {
+                let val = self.compile_expr(value)?;
+                // SRA fast path: if object is scalar-replaced, just update the field variable
+                if let Some(field_vars) = self.sra_records.get(object.as_str()) {
+                    if let Some(&fvar) = field_vars.get(field.as_str()) {
+                        // RC: decref old field value before overwriting
+                        if self.rc_enabled {
+                            let old = self.builder.use_var(fvar);
+                            self.emit_decref(old);
+                        }
+                        self.builder.def_var(fvar, val);
+                        return Ok(self.builder.ins().iconst(types::I64, NV_UNIT as i64));
+                    }
+                }
+                // Boxed path: create updated record and rebind the object variable
+                if let Some(&obj_var) = self.vars.get(object.as_str()) {
+                    let obj_val = self.builder.use_var(obj_var);
+                    // Resolve field index if type info available
+                    let obj_ty = Self::expr_type_hint(&Expr::Var(object.clone(), None));
+                    let field_idx = obj_ty
+                        .as_ref()
+                        .and_then(|t| Self::sorted_field_index(t, field));
+                    let updated = if let Some(idx) = field_idx {
+                        let idx_val = self.builder.ins().iconst(types::I64, idx as i64);
+                        self.call_helper("jit_update_record_indexed1", &[obj_val, idx_val, val])
+                    } else {
+                        // Fall back to string-based update via general helper
+                        let idx_val = self.builder.ins().iconst(types::I64, 0);
+                        self.call_helper("jit_update_record", &[obj_val, idx_val, val])
+                    };
+                    if self.rc_enabled {
+                        let old = self.builder.use_var(obj_var);
+                        self.emit_decref(old);
+                    }
+                    self.builder.def_var(obj_var, updated);
+                }
+                Ok(self.builder.ins().iconst(types::I64, NV_UNIT as i64))
+            }
+
             Expr::Block(exprs, _) => {
                 // SRA: find non-escaping record bindings and track them
                 let self_fn = if self.loop_header.is_some() { Some(self.current_func_name.as_str()) } else { None };
@@ -1754,7 +1817,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     }
                     result = self.compile_expr(e)?;
                     // RC: decref intermediate results (not the last expression)
-                    if self.rc_enabled && !is_last && !matches!(e, Expr::Let { .. } | Expr::Assign { .. }) {
+                    if self.rc_enabled && !is_last && !matches!(e, Expr::Let { .. } | Expr::Assign { .. } | Expr::FieldAssign { .. }) {
                         self.emit_decref(result);
                     }
                 }
@@ -1791,6 +1854,23 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                             let call = self.builder.ins().call(func_ref, &arg_vals);
                             let raw_result = self.builder.inst_results(call)[0];
                             Ok(self.tag_int_checked(raw_result))
+                        } else if let Some(ref field_names) = self.multireturn_info.get(func_idx).and_then(|x| x.as_ref()) {
+                            // Multi-return callee: receive N values, reconstruct boxed record
+                            let arg_vals = self.compile_exprs_stashed(args)?;
+                            let call = self.builder.ins().call(func_ref, &arg_vals);
+                            let results = self.builder.inst_results(call);
+                            let field_vals: Vec<CValue> = results.to_vec();
+
+                            // Build a boxed record from the individual field values.
+                            let mut pair_vals = Vec::with_capacity(field_names.len() * 2);
+                            for (idx, fname) in field_names.iter().enumerate() {
+                                let name_val = self.emit_string_value(fname)?;
+                                pair_vals.push(name_val);
+                                pair_vals.push(field_vals[idx]);
+                            }
+                            let addr = self.spill_to_stack(&pair_vals);
+                            let count = self.builder.ins().iconst(types::I64, field_names.len() as i64);
+                            Ok(self.call_helper("jit_make_record", &[addr, count]))
                         } else {
                             let arg_vals = self.compile_exprs_stashed(args)?;
                             let call = self.builder.ins().call(func_ref, &arg_vals);

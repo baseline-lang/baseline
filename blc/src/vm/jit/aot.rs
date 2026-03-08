@@ -469,6 +469,8 @@ pub fn compile_to_object(module: &IrModule, trace: bool) -> Result<Vec<u8>, Stri
                 rc_enabled: true,
                 rc_scope_stack: Vec::new(),
                 func_call_conv: CallConv::Fast,
+                multireturn_fields: None,
+                multireturn_info: &[],
             };
 
             // RC: push function-level scope with parameter variables

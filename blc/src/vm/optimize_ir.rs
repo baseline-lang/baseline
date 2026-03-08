@@ -1330,6 +1330,11 @@ fn walk_expr_children(expr: Expr, mut f: impl FnMut(Expr) -> Expr) -> Expr {
             name,
             value: Box::new(f(*value)),
         },
+        Expr::FieldAssign { object, field, value } => Expr::FieldAssign {
+            object,
+            field,
+            value: Box::new(f(*value)),
+        },
         Expr::Block(exprs, ty) => Expr::Block(exprs.into_iter().map(&mut f).collect(), ty),
 
         // Calls
@@ -1539,7 +1544,7 @@ fn visit_immediate_children(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             f(iterable);
             f(body);
         }
-        Expr::Let { value, .. } | Expr::Assign { value, .. } => f(value),
+        Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => f(value),
         Expr::Block(exprs, _) => {
             for e in exprs {
                 f(e);
@@ -1678,7 +1683,7 @@ fn visit_expr_children(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         }
 
         // Bindings
-        Expr::Let { value, .. } | Expr::Assign { value, .. } => visit_expr(value, f),
+        Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => visit_expr(value, f),
         Expr::Block(exprs, _) => {
             for e in exprs {
                 visit_expr(e, f);
@@ -1938,6 +1943,21 @@ fn propagate_expr(expr: Expr, env: &mut Vec<HashMap<String, Expr>>) -> Expr {
             }
         }
 
+        Expr::FieldAssign { object, field, value } => {
+            let value = propagate_expr(*value, env);
+            // Invalidate propagated constant for the object variable
+            for scope in env.iter_mut().rev() {
+                if scope.remove(&object).is_some() {
+                    break;
+                }
+            }
+            Expr::FieldAssign {
+                object,
+                field,
+                value: Box::new(value),
+            }
+        }
+
         // All other nodes: recurse into children with propagate_expr
         other => walk_expr_children(other, |child| propagate_expr(child, env)),
     }
@@ -1948,6 +1968,10 @@ fn collect_assigned_vars(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
         Expr::Assign { name, value } => {
             out.insert(name.clone());
+            collect_assigned_vars(value, out);
+        }
+        Expr::FieldAssign { object, value, .. } => {
+            out.insert(object.clone());
             collect_assigned_vars(value, out);
         }
         Expr::Block(exprs, _) => {
@@ -2444,6 +2468,9 @@ fn count_var_uses(expr: &Expr, counts: &mut HashMap<String, usize>) {
             }
             Expr::Assign { name, .. } => {
                 *counts.entry(name.clone()).or_insert(0) += 1;
+            }
+            Expr::FieldAssign { object, .. } => {
+                *counts.entry(object.clone()).or_insert(0) += 1;
             }
             _ => {}
         }
