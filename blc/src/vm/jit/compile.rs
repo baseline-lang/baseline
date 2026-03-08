@@ -62,6 +62,8 @@ pub(super) struct FnCompileCtx<'a, 'b, M: Module> {
     pub(super) scratch_slot: Option<(cranelift_codegen::ir::StackSlot, u32)>,
     /// Whether RC codegen is enabled (scope-based incref/decref).
     pub(super) rc_enabled: bool,
+    /// Values known to be scalar (Int/Float/Bool/Unit) — skip RC incref/decref for these.
+    pub(super) scalar_values: HashSet<CValue>,
     /// Stack of scope frames tracking owned variables for RC cleanup.
     /// Each frame is a list of Variables whose values should be decref'd on scope exit.
     pub(super) rc_scope_stack: Vec<Vec<Variable>>,
@@ -686,14 +688,32 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         }
     }
 
+    /// Mark a Cranelift value as known-scalar (no RC needed).
+    pub(super) fn mark_scalar(&mut self, val: CValue) -> CValue {
+        self.scalar_values.insert(val);
+        val
+    }
+
+    /// Check if a type is scalar (does not need RC).
+    fn type_is_scalar(ty: Option<&Type>) -> bool {
+        matches!(ty, Some(Type::Int | Type::Float | Type::Bool | Type::Unit))
+    }
+
     /// Emit an incref call. Returns the same value (for chaining).
+    /// Skips the call entirely for values known to be scalar (Int/Float/Bool/Unit).
     pub(super) fn emit_incref(&mut self, val: CValue) -> CValue {
+        if self.scalar_values.contains(&val) {
+            return val;
+        }
         self.call_helper("jit_rc_incref", &[val])
     }
 
     /// Emit a decref call for a NaN-boxed value.
-    /// jit_rc_decref checks the tag internally and is a no-op for non-heap values.
+    /// Skips the call entirely for values known to be scalar (Int/Float/Bool/Unit).
     pub(super) fn emit_decref(&mut self, val: CValue) {
+        if self.scalar_values.contains(&val) {
+            return;
+        }
         self.call_helper_void("jit_rc_decref", &[val]);
     }
 
@@ -1461,22 +1481,35 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
 
     pub(super) fn compile_expr(&mut self, expr: &Expr) -> Result<CValue, String> {
         match expr {
-            Expr::Int(n) => Ok(self.emit_nvalue(NValue::int(*n))),
+            Expr::Int(n) => {
+                let val = self.emit_nvalue(NValue::int(*n));
+                Ok(self.mark_scalar(val))
+            }
 
-            Expr::Float(f) => Ok(self.emit_nvalue(NValue::float(*f))),
+            Expr::Float(f) => {
+                let val = self.emit_nvalue(NValue::float(*f));
+                Ok(self.mark_scalar(val))
+            }
 
             Expr::Bool(b) => {
                 let bits = if *b { NV_TRUE } else { NV_FALSE };
-                Ok(self.builder.ins().iconst(types::I64, bits as i64))
+                let val = self.builder.ins().iconst(types::I64, bits as i64);
+                Ok(self.mark_scalar(val))
             }
 
-            Expr::Unit => Ok(self.builder.ins().iconst(types::I64, NV_UNIT as i64)),
+            Expr::Unit => {
+                let val = self.builder.ins().iconst(types::I64, NV_UNIT as i64);
+                Ok(self.mark_scalar(val))
+            }
 
             Expr::String(s) => self.emit_string_value(s),
 
-            Expr::Var(name, _) => {
+            Expr::Var(name, ty) => {
                 if let Some(&var) = self.vars.get(name) {
                     let val = self.builder.use_var(var);
+                    if Self::type_is_scalar(ty.as_ref()) {
+                        self.mark_scalar(val);
+                    }
                     // RC: incref on read — scope still owns the original
                     if self.rc_enabled {
                         Ok(self.emit_incref(val))
@@ -1512,11 +1545,14 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
             Expr::BinOp { op, lhs, rhs, ty } => {
                 let is_int = matches!(ty, Some(Type::Int));
                 let is_float = matches!(ty, Some(Type::Float));
+                // BinOp results are always scalar: arithmetic on int/float produces
+                // int/float, comparisons produce bool, and untyped fallbacks produce int/bool.
+                let result_is_scalar = is_int || is_float || !matches!(op, BinOp::ListConcat);
                 let lhs_val = self.compile_expr(lhs)?;
                 let lhs_val = self.stash_in_var(lhs_val);
                 let rhs_val = self.compile_expr(rhs)?;
 
-                if is_int {
+                let result = if is_int {
                     // Use runtime helpers for arithmetic ops to correctly handle
                     // BigInt overflow (values exceeding 48-bit inline range).
                     // Comparisons that don't produce overflow can use inline ops
@@ -1652,19 +1688,24 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                             }
                         }
                     }
+                };
+                if result_is_scalar {
+                    result.map(|v| self.mark_scalar(v))
+                } else {
+                    result
                 }
             }
 
             Expr::UnaryOp { op, operand, ty } => {
                 let val = self.compile_expr(operand)?;
-                match op {
+                let result = match op {
                     UnaryOp::Neg => {
                         if matches!(ty, Some(Type::Float)) {
                             let f = self.bitcast_to_f64(val);
                             let neg = self.builder.ins().fneg(f);
-                            Ok(self.bitcast_to_i64(neg))
+                            self.bitcast_to_i64(neg)
                         } else {
-                            Ok(self.call_helper("jit_int_neg", &[val]))
+                            self.call_helper("jit_int_neg", &[val])
                         }
                     }
                     UnaryOp::Not => {
@@ -1673,9 +1714,10 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                         let bit = self.builder.ins().band(val, one);
                         let zero = self.builder.ins().iconst(types::I64, 0);
                         let is_falsy = self.builder.ins().icmp(IntCC::Equal, bit, zero);
-                        Ok(self.tag_bool(is_falsy))
+                        self.tag_bool(is_falsy)
                     }
-                }
+                };
+                Ok(self.mark_scalar(result))
             }
 
             Expr::If {
@@ -1805,7 +1847,6 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 let sra_candidates = Self::find_sra_candidates_with_existing(exprs, &self.sra_records, self_fn);
                 let sra_names: std::collections::HashSet<&str> =
                     sra_candidates.iter().map(|(n, _)| n.as_str()).collect();
-
                 self.push_rc_scope();
                 let mut result = self.builder.ins().iconst(types::I64, NV_UNIT as i64);
                 for (idx, e) in exprs.iter().enumerate() {
@@ -2044,7 +2085,8 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     let arg = self.compile_expr(&args[0])?;
                     let arg_f = self.bitcast_to_f64(arg);
                     let out_f = self.builder.ins().sqrt(arg_f);
-                    return Ok(self.bitcast_to_i64(out_f));
+                    let result = self.bitcast_to_i64(out_f);
+                    return Ok(self.mark_scalar(result));
                 }
 
                 // AOT path: direct call to extern "C" symbol in libbaseline_rt
@@ -2287,14 +2329,18 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 object,
                 field,
                 field_idx,
-                ..
+                ty,
             } => {
                 // SRA: if object is a scalar-replaced record, read field variable directly
                 if let Expr::Var(name, _) = object.as_ref()
                     && let Some(field_vars) = self.sra_records.get(name.as_str())
                     && let Some(&var) = field_vars.get(field.as_str())
                 {
-                    return Ok(self.builder.use_var(var));
+                    let val = self.builder.use_var(var);
+                    if Self::type_is_scalar(ty.as_ref()) {
+                        self.mark_scalar(val);
+                    }
+                    return Ok(val);
                 }
                 // Indexed fast path: O(1) field access by compile-time index.
                 if let Some(idx) = field_idx {

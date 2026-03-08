@@ -567,7 +567,15 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     Self::collect_escaping_vars_ex(p, escaping, self_fn_name);
                 }
             }
-            Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => Self::collect_escaping_vars_ex(value, escaping, self_fn_name),
+            Expr::Let { value, .. } => {
+                // Let binding with bare Var value is just an alias — not escaping.
+                // This is critical for inlined code where alias chains like
+                // b0 → __inl_b0_40 → __inl_bi_86 are common.
+                if !matches!(value.as_ref(), Expr::Var(_, _)) {
+                    Self::collect_escaping_vars_ex(value, escaping, self_fn_name);
+                }
+            }
+            Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => Self::collect_escaping_vars_ex(value, escaping, self_fn_name),
             // Self-recursive tail calls: bare Var args don't escape because
             // the SRA tail call can read their fields directly.
             Expr::TailCall { name, args, .. } if self_fn_name == Some(name.as_str()) => {

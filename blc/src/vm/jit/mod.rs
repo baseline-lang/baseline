@@ -25,7 +25,7 @@ mod tests_pattern;
 #[cfg(test)]
 mod tests_rc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -534,6 +534,7 @@ fn compile_inner(
 
                 scratch_slot: None,
                 rc_enabled,
+                scalar_values: HashSet::new(),
                 rc_scope_stack: Vec::new(),
                 func_call_conv: CallConv::Tail,
                 multireturn_fields: multireturn_info[i].clone(),

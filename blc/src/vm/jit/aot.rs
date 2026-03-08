@@ -467,6 +467,7 @@ pub fn compile_to_object(module: &IrModule, trace: bool) -> Result<Vec<u8>, Stri
 
                 scratch_slot: None,
                 rc_enabled: true,
+                scalar_values: HashSet::new(),
                 rc_scope_stack: Vec::new(),
                 func_call_conv: CallConv::Fast,
                 multireturn_fields: None,
