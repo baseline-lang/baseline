@@ -762,6 +762,23 @@ fn run_file_jit(file: &PathBuf) {
                 eprintln!("{}: Runtime Error: {}", file.display(), err);
                 std::process::exit(1);
             }
+
+            // Check if Server.listen! was called (stash-and-return pattern)
+            #[cfg(feature = "async-server")]
+            if let Some((router, port, _config)) = vm::natives::take_server_listen_stash() {
+                let (fn_table, trampolines, rc_enabled) = jit_program.jit_context();
+                let mw_next_idx = jit_program.mw_next_idx();
+                vm::jit::server::run_server(
+                    router,
+                    port as u16,
+                    fn_table,
+                    trampolines,
+                    rc_enabled,
+                    mw_next_idx,
+                );
+                // run_server never returns
+            }
+
             if !val.is_unit() {
                 println!("{}", val);
             }

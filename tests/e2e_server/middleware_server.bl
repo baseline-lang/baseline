@@ -1,0 +1,15 @@
+@prelude(server)
+
+fn add_header(req: Request, next: Unknown) -> {Http} Result<Response, HttpError> = {
+  let res = next(req)?
+  Ok(res |> Response.with_header("X-Middleware", "applied"))
+}
+
+fn hello(req: Request) -> {Http} Result<Response, HttpError> =
+  Ok(Response.ok("hello from handler"))
+
+fn main!() -> {Http} () =
+  Router.new()
+    |> Router.use(add_header)
+    |> Router.get("/hello", hello)
+    |> Server.listen!(18200)
