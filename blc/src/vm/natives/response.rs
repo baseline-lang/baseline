@@ -194,48 +194,30 @@ pub(super) fn native_response_with_headers(args: &[NValue]) -> Result<NValue, Na
 
 /// Response.redirect(url) -> Response with 302 and Location header.
 pub(super) fn native_response_redirect(args: &[NValue]) -> Result<NValue, NativeError> {
-    let url = match args[0].as_string() {
-        Some(s) => s.clone(),
-        None => {
-            return Err(NativeError(format!(
-                "Response.redirect: expected String URL, got {}",
-                args[0]
-            )));
-        }
-    };
-    let headers = vec![NValue::tuple(vec![
-        NValue::string("Location".into()),
-        NValue::string(url),
-    ])];
-    Ok(make_response(302, headers, ""))
+    redirect_with_status(args, 302, "Response.redirect")
 }
 
 /// Response.redirect_permanent(url) -> Response with 301 and Location header.
 pub(super) fn native_response_redirect_permanent(args: &[NValue]) -> Result<NValue, NativeError> {
-    let url = match args[0].as_string() {
-        Some(s) => s.clone(),
-        None => {
-            return Err(NativeError(format!(
-                "Response.redirect_permanent: expected String URL, got {}",
-                args[0]
-            )));
-        }
-    };
-    let headers = vec![NValue::tuple(vec![
-        NValue::string("Location".into()),
-        NValue::string(url),
-    ])];
-    Ok(make_response(301, headers, ""))
+    redirect_with_status(args, 301, "Response.redirect_permanent")
 }
 
 /// Response.redirect_temporary(url) -> Response with 307 and Location header.
 pub(super) fn native_response_redirect_temporary(args: &[NValue]) -> Result<NValue, NativeError> {
+    redirect_with_status(args, 307, "Response.redirect_temporary")
+}
+
+fn redirect_with_status(
+    args: &[NValue],
+    status: i64,
+    native_name: &'static str,
+) -> Result<NValue, NativeError> {
     let url = match args[0].as_string() {
         Some(s) => s.clone(),
         None => {
             return Err(NativeError(format!(
-                "Response.redirect_temporary: expected String URL, got {}",
-                args[0]
+                "{}: expected String URL, got {}",
+                native_name, args[0]
             )));
         }
     };
@@ -243,7 +225,7 @@ pub(super) fn native_response_redirect_temporary(args: &[NValue]) -> Result<NVal
         NValue::string("Location".into()),
         NValue::string(url),
     ])];
-    Ok(make_response(307, headers, ""))
+    Ok(make_response(status, headers, ""))
 }
 
 /// Response.unauthorized(val) -> 401 response with auto-serialization.
