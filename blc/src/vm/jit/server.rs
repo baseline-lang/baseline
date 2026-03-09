@@ -14,10 +14,11 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use std::cell::Cell;
-use std::net::SocketAddr;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 /// Global request counter for generating unique request IDs.
@@ -478,9 +479,11 @@ fn call_with_middleware(
 /// the current request without accepting new requests on keep-alive.
 fn spawn_connection(
     stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
     tree: &std::rc::Rc<RadixTree<JitHandlerInfo>>,
     middleware: &std::rc::Rc<Vec<JitHandlerInfo>>,
     state: &std::rc::Rc<Option<NValue>>,
+    rate_limiter: &std::rc::Rc<RateLimiter>,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
     active: &std::rc::Rc<Cell<u32>>,
     rc_enabled: bool,
@@ -489,14 +492,29 @@ fn spawn_connection(
     let tree = tree.clone();
     let middleware = middleware.clone();
     let state = state.clone();
+    let rate_limiter = rate_limiter.clone();
     let active = active.clone();
     let mut shutdown_rx = shutdown_rx.clone();
+    let peer_ip = peer_addr.ip();
 
     let service = service_fn(move |req: Request<Incoming>| {
         let tree = tree.clone();
         let middleware = middleware.clone();
         let state = state.clone();
-        async move { handle_request(req, &tree, &middleware, &state, rc_enabled, mw_next_idx).await }
+        let rate_limiter = rate_limiter.clone();
+        async move {
+            handle_request(
+                req,
+                &tree,
+                &middleware,
+                &state,
+                &rate_limiter,
+                peer_ip,
+                rc_enabled,
+                mw_next_idx,
+            )
+            .await
+        }
     });
 
     active.set(active.get() + 1);
@@ -546,6 +564,7 @@ async fn accept_loop(
     tree: &std::rc::Rc<RadixTree<JitHandlerInfo>>,
     middleware: &std::rc::Rc<Vec<JitHandlerInfo>>,
     state: &std::rc::Rc<Option<NValue>>,
+    rate_limiter: &std::rc::Rc<RateLimiter>,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
     active: &std::rc::Rc<Cell<u32>>,
     rc_enabled: bool,
@@ -583,12 +602,14 @@ async fn accept_loop(
         };
 
         match accept_result {
-            Ok((stream, _)) => {
+            Ok((stream, peer_addr)) => {
                 spawn_connection(
                     stream,
+                    peer_addr,
                     tree,
                     middleware,
                     state,
+                    rate_limiter,
                     shutdown_rx,
                     active,
                     rc_enabled,
@@ -620,6 +641,77 @@ const MAX_BODY_SIZE: u64 = 1024 * 1024;
 
 /// Keep-alive timeout (30 seconds). Idle connections close after this duration.
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default rate limit: requests per second per IP.
+const RATE_LIMIT_RPS: u32 = 100;
+
+/// Rate limit window duration.
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(1);
+
+// ---------------------------------------------------------------------------
+// Per-IP token bucket rate limiter
+// ---------------------------------------------------------------------------
+
+/// Token bucket entry for a single IP address.
+struct TokenBucket {
+    tokens: u32,
+    last_refill: Instant,
+}
+
+/// Simple per-IP rate limiter using token bucket algorithm.
+///
+/// Single-threaded (Rc<RefCell>) — safe because Tokio current_thread runtime.
+/// Stale entries are cleaned up periodically during `check()`.
+struct RateLimiter {
+    buckets: RefCell<HashMap<IpAddr, TokenBucket>>,
+    max_tokens: u32,
+    window: Duration,
+    check_count: Cell<u32>,
+}
+
+impl RateLimiter {
+    fn new(max_rps: u32) -> Self {
+        Self {
+            buckets: RefCell::new(HashMap::new()),
+            max_tokens: max_rps,
+            window: RATE_LIMIT_WINDOW,
+            check_count: Cell::new(0),
+        }
+    }
+
+    /// Returns true if the request is allowed, false if rate limited.
+    fn check(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut buckets = self.buckets.borrow_mut();
+
+        // Periodic cleanup: every 1000 checks, remove stale entries (>60s idle)
+        let count = self.check_count.get().wrapping_add(1);
+        self.check_count.set(count);
+        if count % 1000 == 0 {
+            buckets.retain(|_, b| now.duration_since(b.last_refill) < Duration::from_secs(60));
+        }
+
+        let bucket = buckets.entry(ip).or_insert(TokenBucket {
+            tokens: self.max_tokens,
+            last_refill: now,
+        });
+
+        // Refill tokens based on elapsed time
+        let elapsed = now.duration_since(bucket.last_refill);
+        if elapsed >= self.window {
+            let refills = (elapsed.as_secs_f64() / self.window.as_secs_f64()) as u32;
+            bucket.tokens = (bucket.tokens + refills * self.max_tokens).min(self.max_tokens);
+            bucket.last_refill = now;
+        }
+
+        if bucket.tokens > 0 {
+            bucket.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Start the JIT HTTP server with graceful shutdown support.
 ///
@@ -685,6 +777,7 @@ pub fn run_server(
         let tree = std::rc::Rc::new(tree);
         let middleware = std::rc::Rc::new(middleware);
         let state = std::rc::Rc::new(state);
+        let rate_limiter = std::rc::Rc::new(RateLimiter::new(RATE_LIMIT_RPS));
 
         // Graceful shutdown: watch channel signals connections to drain
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -696,6 +789,7 @@ pub fn run_server(
             &tree,
             &middleware,
             &state,
+            &rate_limiter,
             &shutdown_rx,
             &active_connections,
             rc_enabled,
@@ -745,6 +839,8 @@ async fn handle_request(
     tree: &RadixTree<JitHandlerInfo>,
     middleware: &[JitHandlerInfo],
     state: &Option<NValue>,
+    rate_limiter: &RateLimiter,
+    peer_ip: IpAddr,
     rc_enabled: bool,
     mw_next_idx: usize,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
@@ -763,6 +859,27 @@ async fn handle_request(
             format!("req-{}", id)
         }
     };
+
+    // Per-IP rate limiting (token bucket)
+    if !rate_limiter.check(peer_ip) {
+        let resp = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("Content-Type", "application/json")
+            .header("Retry-After", "1")
+            .header("X-Request-Id", &request_id)
+            .body(Full::new(Bytes::from(
+                "{\"error\":\"Too Many Requests\",\"retry_after\":1}",
+            )))
+            .unwrap();
+        log_request(
+            &method,
+            &path,
+            resp.status().as_u16(),
+            start.elapsed(),
+            &request_id,
+        );
+        return Ok(resp);
+    }
 
     // Built-in health check endpoint (bypasses route tree and JIT)
     if path == "/__health" && method == hyper::Method::GET {
