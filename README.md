@@ -1,86 +1,134 @@
 # Baseline
 
-**A programming language where the types catch your bugs, the compiler explains what went wrong, and side effects are always visible.**
+A fast, safe functional language that is easy to learn but hard to break, whether you're writing the code yourself or with an AI agent.
 
-Baseline is a typed functional language with an effect system. Functions declare what side effects they perform — reading files, making HTTP calls, printing to the console — and the compiler enforces those declarations. The result is code where you can tell what a function does by reading its signature.
+- **Simple to learn:** Small, consistent syntax that reads the same everywhere.
+- **Fast and lightweight:** Compiled to native code with low memory usage.
+- **Safe by default:** The compiler checks types, effects, and error handling before your code runs.
 
-Baseline also works well with AI code generation tools. Its unambiguous syntax and structured JSON diagnostics make compiler-driven self-correction loops practical.
-
-## Core Ideas
-
-1. **Types prove correctness** — Refinement types like `Int where self > 0` let the compiler verify constraints that would otherwise be runtime checks.
-2. **Effects are visible** — Side effects (I/O, network, filesystem) are declared in function signatures. Pure functions are the default. You see the blast radius before you call.
-3. **Readable by humans and machines** — One syntax for errors, one for effects, one for data pipelines. Whether a person or an AI agent wrote it, you can read it instantly.
-
-## Quick Start
-
-```bash
-# Build the compiler
-cargo build --bin blc
-
-# Initialize a new project
-blc init my-app
-
-# Run a program
-blc run examples/hello.bl
-
-# Check for errors (with JSON output for tooling)
-blc check examples/hello.bl --json
-
-# Run inline tests
-blc test examples/inline_test.bl
-
-# Format source code
-blc fmt examples/hello.bl
+```baseline
+fn fetch_user!(id: Int) -> {Http, Console} Result<String, String> =
+  Console.print!("Fetching user ${id}")
+  let response = Http.get!("/users/${id}")?
+  match response.status
+    200 -> Ok(response.body)
+    404 -> Err("User not found")
+    code -> Err("HTTP ${code}")
 ```
 
-## Language Overview
+You can read this function's entire contract from the first line:
+
+- The `!` suffix means it has side effects, and `{Http, Console}` declares exactly which ones. This function can talk to the network and print output, nothing else.
+- It returns `Result<String, String>` instead of a bare `String`, so the caller knows it can fail and must handle both cases.
+- The `?` after `Http.get!` passes errors up to the caller automatically.
+
+Remove `{Http}` from the declaration and the compiler rejects the program.
+
+## Install
+
+```bash
+brew install baseline-lang/tap/baseline
+```
+
+Or [download a binary](https://github.com/baseline-lang/baseline/releases), or build from source:
+
+```bash
+git clone https://github.com/baseline-lang/baseline.git
+cd baseline && cargo install --path blc --features jit
+```
+
+## Hello World
 
 ```baseline
 @prelude(script)
 
-/// Safe division that returns Result instead of crashing
-fn safe_divide(a: Int, b: Int) -> Result<Int, String> = {
-  if b == 0 then Err("Division by zero")
-  else Ok(a / b)
-}
-  where
-    test "divides correctly" = safe_divide(10, 2) == Ok(5)
-    test "rejects zero" = safe_divide(10, 0) == Err("Division by zero")
-
-/// FizzBuzz — demonstrates control flow, effects, and string interpolation
-fn main!() -> {Console} Unit = {
-  for n in 1..101 do
-    if n % 15 == 0 then Console.println!("FizzBuzz")
-    else if n % 3 == 0 then Console.println!("Fizz")
-    else if n % 5 == 0 then Console.println!("Buzz")
-    else Console.println!("${n}")
-}
+fn main!() -> {Console} () =
+  Console.print!("Hello, World!")
 ```
 
-### Key Features
+```bash
+$ blc run hello.bl
+Hello, World!
+```
 
-- **Effect system** — Functions declare their side effects. `Console.println!` requires `{Console}`. No hidden I/O.
-- **Refinement types** — Validate constraints at the type level: `type Port = Int where self > 0 && self < 65536`
-- **Option and Result** — Safe error handling with `?` propagation, pattern matching, and `map`/`unwrap_or`.
-- **Inline tests** — Tests live next to the code they verify, run with `blc test`.
-- **Pipes** — `data |> List.filter(pred) |> List.map(f)` for readable data pipelines.
-- **Pattern matching** — Exhaustive `match` on sum types, tuples, and literals.
-- **Module system** — `import Math` (qualified), `from Math import {abs, max}` (selective), `from Math import *` (wildcard).
-- **String interpolation** — `"Hello, ${name}!"` with arbitrary expressions.
-- **Weak references** — `Weak<T>` with `Weak.downgrade`/`Weak.upgrade` for breaking reference cycles.
-- **Scoped resources** — `Scoped<T>` with compile-time escape analysis for safe resource management.
+## Types as Specs
 
-### Effect Handlers for Testing
-
-Side-effecting code can be tested in isolation using `with`:
+Refinement types let you state a constraint once. The compiler proves it at every call site.
 
 ```baseline
-test "greet prints hello" = {
-  let (_, output) = with Console.println! {
-    Console.println!("hello")
-  }
-  output == ["hello"]
+type Port = Int where self >= 1 && self <= 65535
+type Percentage = Int where self >= 0 && self <= 100
+
+fn listen(port: Port) -> Unit =
+  // port is guaranteed 1..65535. No validation needed.
+  ...
+```
+
+No `null`, no exceptions, no `undefined`. Model your domain with algebraic types and the compiler holds you to it.
+
+```baseline
+type Connection =
+  | Disconnected
+  | Connected(Socket)
+  | Error(String)
+
+fn status(conn: Connection) -> String =
+  match conn
+    Disconnected      -> "offline"
+    Connected(_)     -> "online"
+    Error(msg)       -> "error: ${msg}"
+```
+
+## Effects as Permissions
+
+Side effects go in the type signature. If a function doesn't declare `{Fs}`, it can't touch the filesystem. No `{Http}` means no network requests. The compiler enforces this, not a linter.
+
+```baseline
+// Pure: no effects, no surprises
+fn add(a: Int, b: Int) -> Int = a + b
+
+// Effectful: declares exactly what it does
+fn save!(data: String) -> {Fs} Unit =
+  Fs.write!("out.txt", data)
+```
+
+Built-in effects:
+
+| Effect | Purpose | Effect | Purpose |
+|--------|---------|--------|---------|
+| `Console` | Terminal I/O | `Http` | Network requests |
+| `Fs` | Filesystem | `Random` | Random numbers |
+| `Env` | Environment vars | `Sqlite` | Database |
+| `Log` | Logging (ambient) | `Time` | Clock (ambient) |
+
+## One Way to Do Each Thing
+
+There's one syntax per operation. Not a style guide, the grammar itself.
+
+| Concept | Baseline | Not supported |
+|---------|----------|---------------|
+| Chaining | `x \|> f \|> g` | method chaining, composition |
+| Errors | `Result<T, E>` + `?` | try/catch, exceptions |
+| Optionals | `Option<T>` | null, undefined, nil |
+| Calls | `Module.fn(value)` | value.method() |
+| Negation | `not x` | `!x` |
+
+## Machine-Readable Diagnostics
+
+The compiler outputs structured JSON so AI agents don't need to scrape error messages.
+
+```json
+$ blc check app.bl --json
+{
+  "status": "failure",
+  "diagnostics": [{
+    "code": "TYP_002",
+    "message": "Undefined variable `nme`",
+    "suggestions": [{
+      "description": "Did you mean `name`?",
+      "confidence": 0.8
+    }]
+  }]
 }
 ```
 
@@ -88,153 +136,17 @@ test "greet prints hello" = {
 
 | Command | Description |
 |---------|-------------|
-| `blc check <file>` | Static analysis (types, effects, refinements). `--json` for structured output. `--level` for verification depth. |
-| `blc run <file>` | Execute via Cranelift JIT. `-- args` to pass program arguments. |
-| `blc test <file>` | Run inline tests. `--json` for structured output. |
-| `blc fmt <file>` | Format source code. `--check` to validate without modifying. |
-| `blc build <file>` | Compile to standalone native executable (AOT via Cranelift). |
-| `blc init [name]` | Initialize a new Baseline project with `baseline.toml` and `src/main.bl`. |
-| `blc docs` | Generate standard library documentation. `--json` for structured output. |
-| `blc lsp` | Start the Language Server Protocol server. |
-
-## Project Structure
-
-```
-baseline/
-├── blc/                        # Compiler and runtime (Rust)
-│   ├── src/
-│   │   ├── analysis/           # Type, effect, and refinement checkers
-│   │   ├── vm/                 # Bytecode compiler, stack VM, JIT, AOT
-│   │   ├── diagnostic_render.rs # Rich diagnostic output with source context
-│   │   ├── docs.rs             # Stdlib documentation generator
-│   │   ├── format.rs           # Code formatter
-│   │   ├── lsp.rs              # Language Server Protocol
-│   │   └── manifest.rs         # Project manifest (baseline.toml)
-│   ├── tests/                  # Unit, conformance, differential, property tests
-│   └── fuzz/                   # Fuzzing targets
-├── baseline-rt/                # Static runtime library for AOT binaries
-├── tree-sitter-baseline/       # Grammar definition and parser
-├── selfhost/                   # Self-hosted compiler (lexer, parser, C codegen)
-├── examples/                   # Example programs
-├── tests/
-│   ├── conformance/            # 170+ conformance tests across 15 categories
-│   └── programs/               # Real programs (fibonacci, sort, calculator, etc.)
-├── benchmarks/cpu/             # Cross-language CPU benchmarks (C, Go, Rust, etc.)
-├── docs/                       # User-facing documentation
-├── extensions/baseline-zed/    # Zed editor extension
-├── scripts/                    # Test runner and diagnostic coverage scripts
-├── design/                     # Language specification and vision documents
-└── .github/workflows/          # CI pipeline
-```
-
-## Available Modules
-
-Modules are gated by prelude level (`@prelude(none|minimal|pure|core|script|server)`):
-
-| Module | Prelude | Functions |
-|--------|---------|-----------|
-| `Option` | minimal+ | `map`, `flat_map`, `unwrap`, `unwrap_or`, `ok_or`, `is_some`, `is_none` |
-| `Result` | minimal+ | `map`, `map_err`, `and_then`, `unwrap`, `unwrap_or`, `is_ok`, `is_err`, `ensure`, `context` |
-| `String` | pure+ | `length`, `slice`, `contains`, `split`, `join`, `trim`, `to_upper`, `to_lower`, `starts_with`, `ends_with`, `chars`, `char_at`, `index_of`, `to_int`, `from_char_code`, `char_code`, `replace`, `matches`, `find_matches`, `replace_regex` |
-| `List` | pure+ | `map`, `filter`, `fold`, `find`, `head`, `tail`, `length`, `sort`, `reverse`, `concat`, `contains`, `get` |
-| `Math` | pure+ | `abs`, `min`, `max`, `clamp`, `pow`, `sqrt`, `sin`, `cos`, `atan2`, `floor`, `ceil` |
-| `Float` | pure+ | `from_int`, `format` |
-| `Json` | pure+ | `parse`, `to_string`, `to_string_pretty`, `to_camel_case`, `to_snake_case` |
-| `Crypto` | pure+ | `sha256`, `hmac_sha256`, `constant_time_eq` |
-| `Weak` | core+ | `downgrade`, `upgrade` |
-| `Int` | core+ | `to_string`, `parse`, `from_float` |
-| `Map` | core+ | `empty`, `insert`, `get`, `remove`, `contains`, `keys`, `values`, `len`, `from_list` |
-| `Set` | core+ | `empty`, `insert`, `remove`, `contains`, `union`, `intersection`, `len`, `from_list` |
-| `Console` | script+ | `println!`, `print!`, `error!`, `read_line!` |
-| `Log` | script+ | `info!`, `warn!`, `error!`, `debug!` |
-| `Time` | script+ | `now!`, `sleep!` |
-| `DateTime` | script+ | `now!`, `parse`, `to_string`, `add`, `diff` |
-| `Random` | script+ | `int!`, `bool!`, `uuid!`, `bytes!` |
-| `Env` | script+ | `get!`, `set!`, `args!` |
-| `Fs` | script+ | `read!`, `write!`, `exists!`, `delete!`, `list_dir!`, `with_file!` |
-| `Http` | script+ | `get!`, `post!`, `put!`, `delete!`, `request!` |
-| `Response` | script+ | `ok`, `json`, `created`, `no_content`, `bad_request`, `not_found`, `error`, `status`, `redirect`, `with_header`, ... |
-| `Request` | script+ | `header`, `method`, `body_json`, `param`, `param_int`, `query`, `query_int`, `decode`, `multipart` |
-| `HttpError` | script+ | `bad_request`, `not_found`, `unauthorized`, `forbidden`, `conflict`, `unprocessable`, `internal`, ... |
-| `Middleware` | script+ | `extract_bearer`, `extract_basic`, `cors_config`, `rate_limit_config` |
-| `Validate` | server | `required`, `string`, `int`, `boolean`, `min_length`, `max_length`, `min`, `max`, `one_of` |
-| `Jwt` | server | `sign`, `sign_with`, `verify`, `decode` |
-| `Session` | server | `create!`, `get!`, `set!`, `delete!` |
-| `Router` | server | `new`, `get`, `post`, `put`, `delete`, `patch`, `options`, `head`, `any`, `use`, `group`, `resources`, `state`, `ws` |
-| `Sqlite` | server | `connect!`, `execute!`, `query!`, `query_one!`, `query_map!`, `query_as!`, `query_one_as!` |
-| `Row` | server | `string`, `int`, `float`, `bool`, `optional_string`, `optional_int`, `decode` |
-| `Server` | server | `listen!` |
-| `Ws` | server | `send!`, `receive!`, `close!` |
-
-## Testing
-
-```bash
-# Full test suite (~600 tests)
-cargo test -p blc
-
-# With JIT and AOT tests (~650 tests)
-cargo test -p blc --features jit,aot
-
-# Fast subset
-scripts/test.sh fast
-
-# Diagnostic coverage report
-scripts/diagnostic-coverage.sh
-```
-
-The test suite includes:
-- **Unit tests** — compiler internals (types, effects, refinements, VM, formatter, LSP)
-- **Conformance tests** — 170+ tests across 15 categories verifying language features
-- **Property tests** — parse-never-panics, analysis-idempotent, soundness, valid-codes
-- **Bootstrap tests** — self-hosted compiler pipeline verification
-
-## Building
-
-### Prerequisites
-
-- Rust (stable, edition 2024)
-- Node.js (for grammar regeneration only)
-
-```bash
-# Default build (VM only)
-cargo build --bin blc
-
-# Full build with JIT and AOT
-cargo build --bin blc --features jit,aot --release
-
-# Regenerate grammar (only needed when changing grammar.js)
-cd tree-sitter-baseline && npx tree-sitter generate && cargo build
-```
+| `blc check <file>` | Static analysis (types, effects, refinements). `--json` for structured output. |
+| `blc run <file>` | Execute via Cranelift JIT. |
+| `blc test <file>` | Run inline tests. |
+| `blc fmt <file>` | Format source code. |
+| `blc build <file>` | Compile to standalone native binary (AOT). |
+| `blc lsp` | Start the language server. |
 
 ## Status
 
-Baseline is in **v0.1 (Bootstrap Phase)**. The core language, type system, effect system, and developer tooling are functional.
+Baseline is in **v0.1 (Bootstrap Phase)**. The core language, type system, effect system, and developer tooling are functional. See the [language specification](design/baseline-language-specification.md) for the full reference and the [getting started guide](docs/getting-started.md) for a walkthrough.
 
-### Implemented
-- Tree-sitter grammar and fault-tolerant parser
-- Type checker with generics, inference, and refinement types
-- Effect system with transitive checking via call graph analysis
-- Bytecode VM with NaN-boxed values and superinstructions
-- Cranelift JIT with tail-call optimization and base-case speculation
-- AOT compilation to standalone native binaries
-- Rich diagnostics with source context, "did you mean?" suggestions
-- LSP server (diagnostics, hover, go-to-definition, completion)
-- Code formatter
-- Inline test framework with effect handlers
-- Module system with qualified, selective, and wildcard imports
-- Self-hosted compiler (lexer, parser, C codegen) for bootstrap verification
-- HTTP server with TLS, compression, static files, CORS, cookies
-- WebSocket support, JWT authentication, server-side sessions
-- Request validation, SQLite/Postgres/MySQL database drivers
-- Structured concurrency with scoped tasks and channels
-- Regex string matching, DateTime handling, cryptographic hashing
-- Editor support (Zed)
-- CI pipeline, fuzzing, conformance and property test suites
+## License
 
-### Planned (v0.2+)
-- Custom effect handlers (beyond capture-only `with`)
-- Regex and string refinements
-- Full standard library (Async, advanced Http)
-- Region-based memory management
-
-See the [language specification](design/baseline-language-specification.md) for the full reference and the [getting started guide](docs/getting-started.md) for a walkthrough.
+MIT
