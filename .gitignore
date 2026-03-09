@@ -51,6 +51,9 @@ selfhost/test_out
 selfhost/.build/
 selfhost/.bootstrap_*
 
+# Claude Code
+.claude/
+
 # Design docs (private language design notes)
 design/
 
