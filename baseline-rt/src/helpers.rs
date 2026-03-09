@@ -337,6 +337,85 @@ pub extern "C" fn jit_enum_field_set(enum_bits: u64, field_idx: u64, new_value_b
 // Perceus reuse helpers
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn record_reuse(bits: u64) -> u64 {
+    #[cfg(debug_assertions)]
+    ALLOC_STATS
+        .reuses
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    bits
+}
+
+/// Specialized drop-reuse for enum values.
+/// Returns 0 when the value is not an enum (caller falls back to generic path).
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_drop_reuse_enum(bits: u64) -> u64 {
+    if bits & TAG_MASK != TAG_HEAP {
+        return 0;
+    }
+    let ptr = (bits & PAYLOAD_MASK) as *mut HeapObject;
+    unsafe {
+        let HeapObject::Enum { tag, payload, .. } = &mut *ptr else {
+            return 0;
+        };
+        drop(std::mem::take(tag));
+        drop(std::mem::take(payload));
+    }
+    record_reuse(bits)
+}
+
+/// Specialized drop-reuse for tuple values.
+/// Returns 0 when the value is not a tuple.
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_drop_reuse_tuple(bits: u64) -> u64 {
+    if bits & TAG_MASK != TAG_HEAP {
+        return 0;
+    }
+    let ptr = (bits & PAYLOAD_MASK) as *mut HeapObject;
+    unsafe {
+        let HeapObject::Tuple(items) = &mut *ptr else {
+            return 0;
+        };
+        drop(std::mem::take(items));
+    }
+    record_reuse(bits)
+}
+
+/// Specialized drop-reuse for record values.
+/// Returns 0 when the value is not a record.
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_drop_reuse_record(bits: u64) -> u64 {
+    if bits & TAG_MASK != TAG_HEAP {
+        return 0;
+    }
+    let ptr = (bits & PAYLOAD_MASK) as *mut HeapObject;
+    unsafe {
+        let HeapObject::Record(fields) = &mut *ptr else {
+            return 0;
+        };
+        drop(std::mem::take(fields));
+    }
+    record_reuse(bits)
+}
+
+/// Specialized drop-reuse for struct values.
+/// Returns 0 when the value is not a struct.
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_drop_reuse_struct(bits: u64) -> u64 {
+    if bits & TAG_MASK != TAG_HEAP {
+        return 0;
+    }
+    let ptr = (bits & PAYLOAD_MASK) as *mut HeapObject;
+    unsafe {
+        let HeapObject::Struct { name, fields } = &mut *ptr else {
+            return 0;
+        };
+        drop(std::mem::take(name));
+        drop(std::mem::take(fields));
+    }
+    record_reuse(bits)
+}
+
 /// Drain inner fields of a HeapObject (decrefs children), leaving the Rc shell alive.
 /// Returns the original NaN-boxed bits as a reuse token (0 if not a heap value).
 /// The compiler has statically proven this is the last use.
@@ -360,7 +439,11 @@ pub extern "C" fn jit_drop_reuse(bits: u64) -> u64 {
                 drop(std::mem::take(tag));
                 drop(std::mem::take(payload));
             }
-            HeapObject::Record(fields) | HeapObject::Struct { fields, .. } => {
+            HeapObject::Record(fields) => {
+                drop(std::mem::take(fields));
+            }
+            HeapObject::Struct { name, fields } => {
+                drop(std::mem::take(name));
                 drop(std::mem::take(fields));
             }
             HeapObject::Tuple(items) | HeapObject::List(items) => {
@@ -375,11 +458,7 @@ pub extern "C" fn jit_drop_reuse(bits: u64) -> u64 {
             }
         }
     }
-    #[cfg(debug_assertions)]
-    ALLOC_STATS
-        .reuses
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    bits
+    record_reuse(bits)
 }
 
 /// Build an enum variant with integer tag_id, reusing an existing allocation if possible.
@@ -957,11 +1036,7 @@ pub extern "C" fn jit_update_record_indexed3(
 /// Fixed-arity indexed update for a single field.
 /// Used by mutable field assignment: `b.field = val`.
 #[unsafe(no_mangle)]
-pub extern "C" fn jit_update_record_indexed1(
-    base_bits: u64,
-    idx0: u64,
-    val0_bits: u64,
-) -> u64 {
+pub extern "C" fn jit_update_record_indexed1(base_bits: u64, idx0: u64, val0_bits: u64) -> u64 {
     let mut base = unsafe { jit_take_arg(base_bits) };
     if !base.is_heap() {
         jit_set_error("update_record on non-record".to_string());
@@ -1679,6 +1754,116 @@ pub extern "C" fn jit_rc_decref_heap(bits: u64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Middleware dispatch (for HTTP server middleware chain)
+// ---------------------------------------------------------------------------
+
+/// Thread-local middleware chain state for the JIT HTTP server.
+/// Set up before calling the first middleware, consumed during the chain.
+struct MwChainState {
+    /// Middleware handler infos: (chunk_idx, is_closure, closure_bits)
+    middleware: Vec<(usize, bool, u64)>,
+    /// Final handler info: (chunk_idx, is_closure, closure_bits)
+    handler: (usize, bool, u64),
+    /// chunk_idx of the __mw_next function (passed as `next` to each middleware)
+    next_chunk_idx: usize,
+    /// Current position in the middleware chain
+    current_idx: usize,
+    /// Whether RC mode is enabled
+    rc_enabled: bool,
+}
+
+thread_local! {
+    static MW_CHAIN: RefCell<Option<MwChainState>> = const { RefCell::new(None) };
+}
+
+/// Set up the middleware chain state before calling the first middleware.
+pub fn mw_chain_setup(
+    middleware: Vec<(usize, bool, u64)>,
+    handler: (usize, bool, u64),
+    next_chunk_idx: usize,
+    rc_enabled: bool,
+) {
+    MW_CHAIN.with(|chain| {
+        *chain.borrow_mut() = Some(MwChainState {
+            middleware,
+            handler,
+            next_chunk_idx,
+            current_idx: 0,
+            rc_enabled,
+        });
+    });
+}
+
+/// Clear the middleware chain state after the chain completes.
+pub fn mw_chain_clear() {
+    MW_CHAIN.with(|chain| {
+        *chain.borrow_mut() = None;
+    });
+}
+
+/// Middleware dispatch: called by __mw_next when middleware calls next(req).
+/// Advances the chain position and calls the next middleware or handler.
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_middleware_dispatch(request_bits: u64) -> u64 {
+    // Read state and advance index
+    let action = MW_CHAIN.with(|chain| {
+        let mut guard = chain.borrow_mut();
+        let state = match guard.as_mut() {
+            Some(s) => s,
+            None => {
+                jit_set_error("Middleware next() called without chain context".into());
+                return None;
+            }
+        };
+
+        let idx = state.current_idx;
+        state.current_idx += 1;
+
+        if idx < state.middleware.len() {
+            let (chunk_idx, is_closure, closure_bits) = state.middleware[idx];
+            let next_chunk_idx = state.next_chunk_idx;
+            let rc_enabled = state.rc_enabled;
+            Some((chunk_idx, is_closure, closure_bits, next_chunk_idx, rc_enabled, false))
+        } else {
+            let (chunk_idx, is_closure, closure_bits) = state.handler;
+            let rc_enabled = state.rc_enabled;
+            Some((chunk_idx, is_closure, closure_bits, 0, rc_enabled, true))
+        }
+    });
+
+    let (chunk_idx, is_closure, closure_bits, next_chunk_idx, rc_enabled, is_handler) =
+        match action {
+            Some(info) => info,
+            None => return NV_UNIT,
+        };
+
+    let fn_ptr = get_fn_ptr_from_table(chunk_idx);
+    if fn_ptr.is_null() {
+        jit_set_error(format!("Middleware chain: function {} not found", chunk_idx));
+        return NV_UNIT;
+    }
+
+    let result = if is_handler {
+        // Handler takes 1 arg: (request)
+        call_jit_fn(fn_ptr, closure_bits, is_closure, &[request_bits])
+    } else {
+        // Middleware takes 2 args: (request, next)
+        let next_nv = NValue::function(next_chunk_idx);
+        call_jit_fn(fn_ptr, closure_bits, is_closure, &[request_bits, next_nv.raw()])
+    };
+
+    // Decrement index back (for correctness if next() is called multiple times)
+    MW_CHAIN.with(|chain| {
+        if let Some(state) = chain.borrow_mut().as_mut() {
+            state.current_idx -= 1;
+        }
+    });
+
+    // RC: the JIT function that called us (middleware) will handle the return value's RC
+    result
+}
+
 /// Drain the JIT arena (free all intermediate heap values).
 /// Must be called AFTER extracting/printing the return value.
 #[unsafe(no_mangle)]
@@ -1797,59 +1982,55 @@ pub extern "C" fn jit_handler_resume(value: u64) -> u64 {
 /// All HANDLER_CTX borrows are short-lived and released before calling handler
 /// clauses, which avoids re-entrant RefCell panics.
 fn dispatch_loop() -> u64 {
-    loop {
-        // Short-lived borrow: determine what to do next.
-        let action = HANDLER_CTX.with(|ctx| {
-            let stack = ctx.borrow();
-            let handler = stack.last().unwrap();
-            match &handler.fiber.state {
-                FiberState::Completed(result) => DispatchAction::Return(*result),
-                FiberState::Yielded { key, args } => {
-                    let key = key.clone();
-                    let args = args.clone();
-                    let clause_idx = handler.handler_keys.iter().position(|k| k == &key);
-                    match clause_idx {
-                        Some(idx) => DispatchAction::CallHandler {
-                            handler_fn_bits: handler.handler_fns[idx],
-                            args,
-                        },
-                        None => DispatchAction::Error(format!(
-                            "jit_run_fiber_handler: no handler for effect '{}'",
-                            key
-                        )),
-                    }
+    // Short-lived borrow: determine what to do next.
+    let action = HANDLER_CTX.with(|ctx| {
+        let stack = ctx.borrow();
+        let handler = stack.last().unwrap();
+        match &handler.fiber.state {
+            FiberState::Completed(result) => DispatchAction::Return(*result),
+            FiberState::Yielded { key, args } => {
+                let key = key.clone();
+                let args = args.clone();
+                let clause_idx = handler.handler_keys.iter().position(|k| k == &key);
+                match clause_idx {
+                    Some(idx) => DispatchAction::CallHandler {
+                        handler_fn_bits: handler.handler_fns[idx],
+                        args,
+                    },
+                    None => DispatchAction::Error(format!(
+                        "jit_run_fiber_handler: no handler for effect '{}'",
+                        key
+                    )),
                 }
-                FiberState::Ready => {
-                    DispatchAction::Error("fiber in Ready state after resume".into())
+            }
+            FiberState::Ready => DispatchAction::Error("fiber in Ready state after resume".into()),
+            FiberState::Aborted => DispatchAction::Error("fiber was aborted".into()),
+        }
+    }); // borrow dropped — safe to call handler clauses
+
+    match action {
+        DispatchAction::Return(result) => result,
+        DispatchAction::CallHandler {
+            handler_fn_bits,
+            args,
+        } => {
+            let result = call_handler_clause(handler_fn_bits, &args);
+
+            // If the handler didn't call resume (abort pattern), the fiber
+            // is still in Yielded state — mark it aborted.
+            HANDLER_CTX.with(|ctx| {
+                let mut stack = ctx.borrow_mut();
+                let handler = stack.last_mut().unwrap();
+                if let FiberState::Yielded { .. } = &handler.fiber.state {
+                    handler.fiber.state = FiberState::Aborted;
                 }
-                FiberState::Aborted => DispatchAction::Error("fiber was aborted".into()),
-            }
-        }); // borrow dropped — safe to call handler clauses
+            });
 
-        match action {
-            DispatchAction::Return(result) => return result,
-            DispatchAction::CallHandler {
-                handler_fn_bits,
-                args,
-            } => {
-                let result = call_handler_clause(handler_fn_bits, &args);
-
-                // If the handler didn't call resume (abort pattern), the fiber
-                // is still in Yielded state — mark it aborted.
-                HANDLER_CTX.with(|ctx| {
-                    let mut stack = ctx.borrow_mut();
-                    let handler = stack.last_mut().unwrap();
-                    if let FiberState::Yielded { .. } = &handler.fiber.state {
-                        handler.fiber.state = FiberState::Aborted;
-                    }
-                });
-
-                return result;
-            }
-            DispatchAction::Error(msg) => {
-                jit_set_error(msg);
-                return NV_UNIT;
-            }
+            result
+        }
+        DispatchAction::Error(msg) => {
+            jit_set_error(msg);
+            NV_UNIT
         }
     }
 }
@@ -1952,7 +2133,7 @@ fn call_handler_clause(handler_fn_bits: u64, args: &[u64]) -> u64 {
 }
 
 /// Get a function pointer from the JIT fn table by chunk index.
-fn get_fn_ptr_from_table(chunk_idx: usize) -> *const u8 {
+pub fn get_fn_ptr_from_table(chunk_idx: usize) -> *const u8 {
     JIT_FN_TABLE.with(|table| {
         let guard = table.borrow();
         match guard.as_ref() {
@@ -1967,7 +2148,7 @@ fn get_fn_ptr_from_table(chunk_idx: usize) -> *const u8 {
 ///
 /// JIT functions use Cranelift Tail CC. Calls go through per-arity trampolines
 /// that bridge platform CC → Tail CC via Cranelift indirect calls.
-fn call_jit_fn(fn_ptr: *const u8, fn_bits: u64, is_closure: bool, args: &[u64]) -> u64 {
+pub fn call_jit_fn(fn_ptr: *const u8, fn_bits: u64, is_closure: bool, args: &[u64]) -> u64 {
     let total_args = if is_closure {
         1 + args.len()
     } else {

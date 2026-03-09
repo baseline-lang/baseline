@@ -16,6 +16,9 @@ mod helpers;
 #[cfg(feature = "aot")]
 pub mod aot;
 
+#[cfg(feature = "async-server")]
+pub mod server;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -40,7 +43,9 @@ use super::ir::IrModule;
 use super::natives::NativeRegistry;
 use super::nvalue::NValue;
 
-use analysis::{can_jit, compute_multireturn_info, compute_unboxed_flags, has_self_tail_call, is_scalar_only};
+use analysis::{
+    can_jit, compute_multireturn_info, compute_unboxed_flags, has_self_tail_call, is_scalar_only,
+};
 use compile::FnCompileCtx;
 use helpers::*;
 
@@ -99,6 +104,10 @@ pub struct JitProgram {
     trampolines: [*const u8; 5],
     /// Whether RC codegen is enabled (scope-based incref/decref).
     rc_enabled: bool,
+    /// Index in fn_table for the __mw_next function (middleware chain dispatcher).
+    /// Middleware receives NValue::Function(mw_next_idx) as its `next` parameter.
+    #[cfg(feature = "async-server")]
+    mw_next_idx: usize,
 }
 
 // SAFETY: JitProgram is Send because:
@@ -125,6 +134,18 @@ impl JitProgram {
     /// Returns None if the function was not JIT-compiled.
     pub fn get_fn(&self, idx: usize) -> Option<*const u8> {
         self.dispatch.get(idx).copied().flatten()
+    }
+
+    /// Get the JIT context needed for calling JIT functions from Rust.
+    /// Returns (fn_table, trampolines, rc_enabled).
+    pub fn jit_context(&self) -> (&[*const u8], [*const u8; 5], bool) {
+        (&self.fn_table, self.trampolines, self.rc_enabled)
+    }
+
+    /// Get the chunk_idx for the middleware next dispatcher function.
+    #[cfg(feature = "async-server")]
+    pub fn mw_next_idx(&self) -> usize {
+        self.mw_next_idx
     }
 
     fn entry_fn(&self) -> Option<EntryFn> {
@@ -332,6 +353,10 @@ const HELPER_SYMBOLS: &[(&str, *const u8)] = &[
     ("jit_set_rc_mode_raw", jit_set_rc_mode_raw as *const u8),
     // Perceus reuse helpers
     ("jit_drop_reuse", jit_drop_reuse as *const u8),
+    ("jit_drop_reuse_enum", jit_drop_reuse_enum as *const u8),
+    ("jit_drop_reuse_tuple", jit_drop_reuse_tuple as *const u8),
+    ("jit_drop_reuse_record", jit_drop_reuse_record as *const u8),
+    ("jit_drop_reuse_struct", jit_drop_reuse_struct as *const u8),
     ("jit_make_enum_reuse", jit_make_enum_reuse as *const u8),
     (
         "jit_make_enum_flat_reuse",
@@ -339,6 +364,11 @@ const HELPER_SYMBOLS: &[(&str, *const u8)] = &[
     ),
     ("jit_make_record_reuse", jit_make_record_reuse as *const u8),
     ("jit_make_tuple_reuse", jit_make_tuple_reuse as *const u8),
+    // Middleware dispatch
+    (
+        "jit_middleware_dispatch",
+        jit_middleware_dispatch as *const u8,
+    ),
 ];
 
 /// Helper names only — derived from HELPER_SYMBOLS for AOT declaration.
@@ -628,9 +658,12 @@ fn compile_inner(
                             for (idx, _fname) in field_names.iter().enumerate() {
                                 let idx_val = fn_builder.ins().iconst(types::I64, idx as i64);
                                 // Import jit_get_field_idx helper
-                                let helper_id = helper_ids.get("jit_get_field_idx").copied()
+                                let helper_id = helper_ids
+                                    .get("jit_get_field_idx")
+                                    .copied()
                                     .expect("jit_get_field_idx helper not found");
-                                let helper_ref = jit_module.declare_func_in_func(helper_id, fn_builder.func);
+                                let helper_ref =
+                                    jit_module.declare_func_in_func(helper_id, fn_builder.func);
                                 let call = fn_builder.ins().call(helper_ref, &[val, idx_val]);
                                 return_vals.push(fn_builder.inst_results(call)[0]);
                             }
@@ -696,6 +729,11 @@ fn compile_inner(
 
     let trampoline_ids = create_trampolines(&mut jit_module, &mut fb_ctx, ptr_type)?;
 
+    // Compile __mw_next: a Tail CC function that calls jit_middleware_dispatch.
+    // This function is used as the `next` parameter for middleware chains.
+    #[cfg(feature = "async-server")]
+    let mw_next_id = create_mw_next(&mut jit_module, &mut fb_ctx, &helper_ids)?;
+
     // Phase 3: Finalize and get function pointers.
     // Wrap in catch_unwind because Cranelift may panic on unresolvable symbols
     // (e.g., unsupported IR constructs that produce undefined function references).
@@ -742,6 +780,15 @@ fn compile_inner(
         }
     }
 
+    // Add __mw_next to fn_table at the end (its chunk_idx = dispatch.len())
+    #[cfg(feature = "async-server")]
+    let mw_next_idx = dispatch.len();
+    #[cfg(feature = "async-server")]
+    {
+        let mw_next_ptr = jit_module.get_finalized_function(mw_next_id);
+        dispatch.push(Some(mw_next_ptr));
+    }
+
     Ok(JitProgram {
         _module: jit_module,
         fn_table: dispatch
@@ -755,6 +802,8 @@ fn compile_inner(
         entry_wrapper: entry_wrapper_ptr,
         trampolines,
         rc_enabled,
+        #[cfg(feature = "async-server")]
+        mw_next_idx,
     })
 }
 // ---------------------------------------------------------------------------
@@ -859,6 +908,62 @@ fn create_trampolines(
         trampoline_ids[arity] = Some(tramp_id);
     }
     Ok(trampoline_ids)
+}
+
+/// Create the __mw_next function: a Tail CC wrapper around jit_middleware_dispatch.
+///
+/// This function is stored in fn_table and used as NValue::Function(mw_next_idx)
+/// for middleware's `next` parameter. When middleware calls `next(req)`, the JIT
+/// dispatches through CallIndirect to this function, which bridges to the Rust
+/// middleware chain dispatcher.
+///
+/// Signature (Tail CC): (request_bits: i64) -> i64
+/// Body: call jit_middleware_dispatch(request_bits), return result
+#[cfg(feature = "async-server")]
+fn create_mw_next(
+    jit_module: &mut JITModule,
+    fb_ctx: &mut FunctionBuilderContext,
+    helper_ids: &HashMap<&str, FuncId>,
+) -> Result<FuncId, String> {
+    let mut sig = jit_module.make_signature();
+    sig.call_conv = CallConv::Tail;
+    sig.params.push(AbiParam::new(types::I64)); // request_bits
+    sig.returns.push(AbiParam::new(types::I64)); // result
+
+    let func_id = jit_module
+        .declare_function("__mw_next", Linkage::Local, &sig)
+        .map_err(|e| e.to_string())?;
+
+    let mut cl_func = cranelift_codegen::ir::Function::new();
+    cl_func.signature = sig;
+
+    {
+        let mut builder = FunctionBuilder::new(&mut cl_func, fb_ctx);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+
+        let request_bits = builder.block_params(block)[0];
+
+        // Call jit_middleware_dispatch(request_bits) → result
+        let dispatch_id = helper_ids
+            .get("jit_middleware_dispatch")
+            .ok_or("JIT: jit_middleware_dispatch helper not found")?;
+        let dispatch_ref = jit_module.declare_func_in_func(*dispatch_id, builder.func);
+        let call = builder.ins().call(dispatch_ref, &[request_bits]);
+        let result = builder.inst_results(call)[0];
+
+        builder.ins().return_(&[result]);
+        builder.finalize();
+    }
+
+    let mut ctx = cranelift_codegen::Context::for_function(cl_func);
+    jit_module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| format!("JIT: __mw_next error: {}", e))?;
+
+    Ok(func_id)
 }
 
 fn build_signature(module: &mut JITModule, param_count: usize) -> cranelift_codegen::ir::Signature {
@@ -995,7 +1100,8 @@ pub(super) fn make_helper_sig<M: Module>(
             sig.returns.push(AbiParam::new(types::I64));
         }
         "jit_string_reverse" | "jit_enum_tag_id" | "jit_enum_payload" | "jit_list_length"
-        | "jit_is_err" | "jit_is_none" | "jit_int_from_i64" | "jit_int_neg" => {
+        | "jit_is_err" | "jit_is_none" | "jit_int_from_i64" | "jit_int_neg"
+        | "jit_middleware_dispatch" => {
             // (val) -> u64
             sig.params.push(AbiParam::new(types::I64));
             sig.returns.push(AbiParam::new(types::I64));
@@ -1098,7 +1204,11 @@ pub(super) fn make_helper_sig<M: Module>(
             sig.params.push(AbiParam::new(types::I64));
         }
         // Perceus reuse helpers
-        "jit_drop_reuse" => {
+        "jit_drop_reuse"
+        | "jit_drop_reuse_enum"
+        | "jit_drop_reuse_tuple"
+        | "jit_drop_reuse_record"
+        | "jit_drop_reuse_struct" => {
             // (bits: i64) -> u64
             sig.params.push(AbiParam::new(types::I64));
             sig.returns.push(AbiParam::new(types::I64));
