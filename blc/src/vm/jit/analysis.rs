@@ -181,7 +181,9 @@ pub(super) fn expr_can_jit(expr: &Expr, natives: Option<&NativeRegistry>) -> boo
         // (evidence transform) and non-tail-resumptive (fiber transform) are
         // eliminated before this check. This false is a safety net only.
         Expr::WithHandlers { .. } | Expr::HandleEffect { .. } | Expr::PerformEffect { .. } => false,
-        Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => expr_can_jit(value, natives),
+        Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => {
+            expr_can_jit(value, natives)
+        }
     }
 }
 
@@ -219,7 +221,7 @@ fn matcher_can_jit(matcher: &Matcher, natives: Option<&NativeRegistry>) -> bool 
 // Scalar-only analysis for unboxed fast path
 // ---------------------------------------------------------------------------
 
-/// Check if a function body only uses scalar types (Int, Bool, Unit, Float).
+/// Check if a function body only uses scalar types (Int, Bool, Unit).
 /// Functions marked scalar-only can use unboxed codegen internally.
 pub(super) fn is_scalar_only(func: &IrFunction) -> bool {
     expr_is_scalar(&func.body)
@@ -310,7 +312,7 @@ fn collect_called_functions(expr: &Expr, out: &mut Vec<String>) {
 /// Compute which functions can use unboxed codegen. A function is unboxed if:
 ///
 /// 1. Its body is scalar-only (no strings, lists, records, etc.)
-/// 2. Its return type is Int (the hot path for benchmarks)
+/// 2. Its return type is a supported scalar boundary type (currently Int/Bool/Unit)
 /// 3. All functions it calls are also unboxed
 ///
 /// Uses fixed-point iteration to handle mutual recursion.
@@ -492,7 +494,8 @@ pub(super) fn compute_unboxed_flags(module: &IrModule) -> Vec<bool> {
         .map(|(i, f)| {
             i != module.entry
                 && is_scalar_only(f)
-                && !matches!(f.ty, Some(Type::Bool | Type::Float))
+                // Float operations still use boxed lowering; keep Float returns boxed.
+                && !matches!(f.ty, Some(Type::Float))
                 && !f.name.starts_with("__lambda_")
                 && !indirect_targets.contains(&f.name)
         })

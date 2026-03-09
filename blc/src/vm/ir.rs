@@ -565,7 +565,7 @@ mod tests {
                 body: Expr::Int(42),
                 ty: None,
                 param_types: vec![],
-            span: Span {
+                span: Span {
                     line: 1,
                     col: 0,
                     start_byte: 0,

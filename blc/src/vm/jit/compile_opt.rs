@@ -160,10 +160,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 sorted_fields.sort();
 
                 for (field_idx, fname) in sorted_fields.iter().enumerate() {
-                    let idx_val = self
-                        .builder
-                        .ins()
-                        .iconst(types::I64, field_idx as i64);
+                    let idx_val = self.builder.ins().iconst(types::I64, field_idx as i64);
                     let field_val =
                         self.call_helper("jit_get_field_idx", &[boxed_stashed, idx_val]);
                     let stashed = self.stash_in_var(field_val);
@@ -544,7 +541,9 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 Self::collect_escaping_vars_ex(lhs, escaping, self_fn_name);
                 Self::collect_escaping_vars_ex(rhs, escaping, self_fn_name);
             }
-            Expr::UnaryOp { operand, .. } => Self::collect_escaping_vars_ex(operand, escaping, self_fn_name),
+            Expr::UnaryOp { operand, .. } => {
+                Self::collect_escaping_vars_ex(operand, escaping, self_fn_name)
+            }
             Expr::If {
                 condition,
                 then_branch,
@@ -575,7 +574,9 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     Self::collect_escaping_vars_ex(value, escaping, self_fn_name);
                 }
             }
-            Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => Self::collect_escaping_vars_ex(value, escaping, self_fn_name),
+            Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => {
+                Self::collect_escaping_vars_ex(value, escaping, self_fn_name)
+            }
             // Self-recursive tail calls: bare Var args don't escape because
             // the SRA tail call can read their fields directly.
             Expr::TailCall { name, args, .. } if self_fn_name == Some(name.as_str()) => {
@@ -607,7 +608,9 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     Self::collect_escaping_vars_ex(&arm.body, escaping, self_fn_name);
                 }
             }
-            Expr::MakeEnum { payload, .. } => Self::collect_escaping_vars_ex(payload, escaping, self_fn_name),
+            Expr::MakeEnum { payload, .. } => {
+                Self::collect_escaping_vars_ex(payload, escaping, self_fn_name)
+            }
             Expr::MakeStruct { fields, .. } | Expr::MakeRecord(fields, _) => {
                 for (_, v) in fields {
                     Self::collect_escaping_vars_ex(v, escaping, self_fn_name);
@@ -627,7 +630,9 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     Self::collect_escaping_vars_ex(c, escaping, self_fn_name);
                 }
             }
-            Expr::Lambda { body, .. } => Self::collect_escaping_vars_ex(body, escaping, self_fn_name),
+            Expr::Lambda { body, .. } => {
+                Self::collect_escaping_vars_ex(body, escaping, self_fn_name)
+            }
             Expr::WithHandlers { handlers, body, .. } => {
                 for (_, methods) in handlers {
                     for (_, h) in methods {
@@ -647,9 +652,13 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     Self::collect_escaping_vars_ex(a, escaping, self_fn_name);
                 }
             }
-            Expr::Expect { actual, .. } => Self::collect_escaping_vars_ex(actual, escaping, self_fn_name),
+            Expr::Expect { actual, .. } => {
+                Self::collect_escaping_vars_ex(actual, escaping, self_fn_name)
+            }
             Expr::Drop { body, .. } => Self::collect_escaping_vars_ex(body, escaping, self_fn_name),
-            Expr::Reuse { alloc, .. } => Self::collect_escaping_vars_ex(alloc, escaping, self_fn_name),
+            Expr::Reuse { alloc, .. } => {
+                Self::collect_escaping_vars_ex(alloc, escaping, self_fn_name)
+            }
         }
     }
 }

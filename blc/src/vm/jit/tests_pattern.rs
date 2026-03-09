@@ -427,7 +427,11 @@ fn jit_sra_escape_falls_back() {
             ty: None,
         },
     ];
-    let candidates = FnCompileCtx::<JITModule>::find_sra_candidates_with_existing(&exprs, &std::collections::HashMap::new(), None);
+    let candidates = FnCompileCtx::<JITModule>::find_sra_candidates_with_existing(
+        &exprs,
+        &std::collections::HashMap::new(),
+        None,
+    );
     assert!(
         candidates.is_empty(),
         "Escaping record should not be SRA candidate"
@@ -453,7 +457,11 @@ fn jit_sra_non_escape_detected() {
             ty: Some(Type::Int),
         },
     ];
-    let candidates = FnCompileCtx::<JITModule>::find_sra_candidates_with_existing(&exprs, &std::collections::HashMap::new(), None);
+    let candidates = FnCompileCtx::<JITModule>::find_sra_candidates_with_existing(
+        &exprs,
+        &std::collections::HashMap::new(),
+        None,
+    );
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].0, "r");
     assert_eq!(candidates[0].1, vec!["x".to_string(), "y".to_string()]);

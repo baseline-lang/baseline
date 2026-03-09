@@ -1,0 +1,18 @@
+@prelude(core)
+
+fn main() -> Int = {
+  let m = Map.empty()
+  let m = Map.insert(m, "a", 1)
+  let m = Map.insert(m, "b", 2)
+  let m = Map.insert(m, "c", 3)
+  let vals = Map.values(m)
+  let entries = Map.entries(m)
+  let m2 = Map.remove(m, "b")
+  let keys = Map.keys(m2)
+  let has_b = Map.contains(m2, "b")
+  List.length(vals)
+    + List.length(entries)
+    + List.length(keys)
+    + Map.len(m2)
+    + (if has_b then 1 else 0)
+}

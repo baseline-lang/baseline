@@ -97,9 +97,10 @@ pub struct JitProgram {
     /// Heap roots: keeps Rc-based NValues alive for JIT code's lifetime.
     _heap_roots: Vec<NValue>,
     /// Entry wrapper pointer (platform-default CC, safe to call via transmute).
-    /// All language functions use Tail CC; this wrapper bridges to the host ABI.
+    /// Language functions use the selected internal call convention; this wrapper
+    /// bridges from host ABI to that internal ABI.
     entry_wrapper: *const u8,
-    /// Per-arity trampolines bridging platform CC → Tail CC for indirect calls.
+    /// Per-arity trampolines bridging platform CC → internal CC for indirect calls.
     /// Index = arity (0..=4). Used by call_jit_fn to call JIT functions from Rust.
     trampolines: [*const u8; 5],
     /// Whether RC codegen is enabled (scope-based incref/decref).
@@ -351,6 +352,19 @@ const HELPER_SYMBOLS: &[(&str, *const u8)] = &[
     ("jit_rc_incref", jit_rc_incref as *const u8),
     ("jit_rc_decref", jit_rc_decref as *const u8),
     ("jit_set_rc_mode_raw", jit_set_rc_mode_raw as *const u8),
+    // Optional runtime profiling counters
+    (
+        "jit_counter_helper_call",
+        jit_counter_helper_call as *const u8,
+    ),
+    (
+        "jit_counter_box_boundary",
+        jit_counter_box_boundary as *const u8,
+    ),
+    (
+        "jit_counter_unbox_boundary",
+        jit_counter_unbox_boundary as *const u8,
+    ),
     // Perceus reuse helpers
     ("jit_drop_reuse", jit_drop_reuse as *const u8),
     ("jit_drop_reuse_enum", jit_drop_reuse_enum as *const u8),
@@ -391,12 +405,47 @@ pub fn compile_with_natives(
     compile_inner(module, trace, natives, true).map_err(|e| e.to_string())
 }
 
+fn selected_jit_call_conv() -> JitResult<CallConv> {
+    match std::env::var("BLC_JIT_CALL_CONV") {
+        Ok(raw) => {
+            let value = raw.trim().to_ascii_lowercase();
+            match value.as_str() {
+                "tail" => Ok(CallConv::Tail),
+                "fast" => Ok(CallConv::Fast),
+                _ => Err(JitError::from(format!(
+                    "Invalid BLC_JIT_CALL_CONV='{}'. Expected 'tail' or 'fast'.",
+                    raw
+                ))),
+            }
+        }
+        Err(std::env::VarError::NotPresent) => Ok(CallConv::Tail),
+        Err(e) => Err(JitError::from(format!(
+            "Failed to read BLC_JIT_CALL_CONV: {}",
+            e
+        ))),
+    }
+}
+
+fn jit_counters_enabled() -> bool {
+    match std::env::var("BLC_JIT_COUNTERS") {
+        Ok(raw) => {
+            let value = raw.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(_) => false,
+    }
+}
+
 fn compile_inner(
     module: &IrModule,
     trace: bool,
     natives: Option<&NativeRegistry>,
     rc_enabled: bool,
 ) -> JitResult<JitProgram> {
+    let func_call_conv = selected_jit_call_conv()?;
+    let counters_enabled = jit_counters_enabled();
+
     let mut flag_builder = settings::builder();
     flag_builder
         .set("opt_level", "speed")
@@ -451,9 +500,14 @@ fn compile_inner(
         let can = can_jit(func, natives);
         if can {
             let sig = if let Some(ref fields) = multireturn_info[i] {
-                build_signature_multireturn(&mut jit_module, func.params.len(), fields.len())
+                build_signature_multireturn(
+                    &mut jit_module,
+                    func.params.len(),
+                    fields.len(),
+                    func_call_conv,
+                )
             } else {
-                build_signature(&mut jit_module, func.params.len())
+                build_signature(&mut jit_module, func.params.len(), func_call_conv)
             };
             let id = jit_module
                 .declare_function(&func.name, Linkage::Local, &sig)
@@ -504,9 +558,14 @@ fn compile_inner(
 
         let mut cl_func = cranelift_codegen::ir::Function::new();
         cl_func.signature = if let Some(ref fields) = multireturn_info[i] {
-            build_signature_multireturn(&mut jit_module, func.params.len(), fields.len())
+            build_signature_multireturn(
+                &mut jit_module,
+                func.params.len(),
+                fields.len(),
+                func_call_conv,
+            )
         } else {
-            build_signature(&mut jit_module, func.params.len())
+            build_signature(&mut jit_module, func.params.len(), func_call_conv)
         };
 
         let compile_result = {
@@ -566,7 +625,8 @@ fn compile_inner(
                 rc_enabled,
                 scalar_values: HashSet::new(),
                 rc_scope_stack: Vec::new(),
-                func_call_conv: CallConv::Tail,
+                func_call_conv,
+                jit_counters_enabled: counters_enabled,
                 multireturn_fields: multireturn_info[i].clone(),
                 multireturn_info: &multireturn_info,
             };
@@ -718,21 +778,25 @@ fn compile_inner(
     let entry_wrapper_id = if compilable.get(module.entry).copied().unwrap_or(false) {
         let entry_func_id = func_ids[module.entry]
             .ok_or_else(|| "JIT: entry function was not compiled".to_string())?;
-        let id = create_entry_wrapper(&mut jit_module, &mut fb_ctx, entry_func_id)?;
+        let id = create_entry_wrapper(&mut jit_module, &mut fb_ctx, entry_func_id, func_call_conv)?;
         if trace {
-            eprintln!("JIT: created entry wrapper (platform CC → Tail CC)");
+            eprintln!(
+                "JIT: created entry wrapper (platform CC → {:?})",
+                func_call_conv
+            );
         }
         Some(id)
     } else {
         None
     };
 
-    let trampoline_ids = create_trampolines(&mut jit_module, &mut fb_ctx, ptr_type)?;
+    let trampoline_ids =
+        create_trampolines(&mut jit_module, &mut fb_ctx, ptr_type, func_call_conv)?;
 
-    // Compile __mw_next: a Tail CC function that calls jit_middleware_dispatch.
+    // Compile __mw_next: an internal-CC function that calls jit_middleware_dispatch.
     // This function is used as the `next` parameter for middleware chains.
     #[cfg(feature = "async-server")]
-    let mw_next_id = create_mw_next(&mut jit_module, &mut fb_ctx, &helper_ids)?;
+    let mw_next_id = create_mw_next(&mut jit_module, &mut fb_ctx, &helper_ids, func_call_conv)?;
 
     // Phase 3: Finalize and get function pointers.
     // Wrap in catch_unwind because Cranelift may panic on unresolvable symbols
@@ -810,12 +874,13 @@ fn compile_inner(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create a platform-CC entry wrapper that calls the Tail-CC entry function.
+/// Create a platform-CC entry wrapper that calls the internal-CC entry function.
 /// Bridges host ABI so `transmute::<_, fn() -> u64>` works correctly.
 fn create_entry_wrapper(
     jit_module: &mut JITModule,
     fb_ctx: &mut FunctionBuilderContext,
     entry_func_id: FuncId,
+    _entry_call_conv: CallConv,
 ) -> Result<FuncId, String> {
     let mut wrapper_sig = jit_module.make_signature();
     wrapper_sig.returns.push(AbiParam::new(types::I64));
@@ -848,13 +913,14 @@ fn create_entry_wrapper(
     Ok(wrapper_id)
 }
 
-/// Create per-arity trampolines (platform CC → Tail CC) for indirect calls.
+/// Create per-arity trampolines (platform CC → internal CC) for indirect calls.
 /// Each trampoline takes a function pointer (first arg) plus N value args,
-/// and does a Cranelift indirect call with Tail CC.
+/// and does a Cranelift indirect call with the selected internal CC.
 fn create_trampolines(
     jit_module: &mut JITModule,
     fb_ctx: &mut FunctionBuilderContext,
     ptr_type: cranelift_codegen::ir::Type,
+    target_call_conv: CallConv,
 ) -> Result<[Option<FuncId>; 5], String> {
     let mut trampoline_ids: [Option<FuncId>; 5] = [None; 5];
     for arity in 0..5usize {
@@ -887,7 +953,7 @@ fn create_trampolines(
                 .collect();
 
             let mut target_sig = jit_module.make_signature();
-            target_sig.call_conv = CallConv::Tail;
+            target_sig.call_conv = target_call_conv;
             for _ in 0..arity {
                 target_sig.params.push(AbiParam::new(types::I64));
             }
@@ -910,23 +976,24 @@ fn create_trampolines(
     Ok(trampoline_ids)
 }
 
-/// Create the __mw_next function: a Tail CC wrapper around jit_middleware_dispatch.
+/// Create the __mw_next function using the internal call convention.
 ///
 /// This function is stored in fn_table and used as NValue::Function(mw_next_idx)
 /// for middleware's `next` parameter. When middleware calls `next(req)`, the JIT
 /// dispatches through CallIndirect to this function, which bridges to the Rust
 /// middleware chain dispatcher.
 ///
-/// Signature (Tail CC): (request_bits: i64) -> i64
+/// Signature (internal CC): (request_bits: i64) -> i64
 /// Body: call jit_middleware_dispatch(request_bits), return result
 #[cfg(feature = "async-server")]
 fn create_mw_next(
     jit_module: &mut JITModule,
     fb_ctx: &mut FunctionBuilderContext,
     helper_ids: &HashMap<&str, FuncId>,
+    call_conv: CallConv,
 ) -> Result<FuncId, String> {
     let mut sig = jit_module.make_signature();
-    sig.call_conv = CallConv::Tail;
+    sig.call_conv = call_conv;
     sig.params.push(AbiParam::new(types::I64)); // request_bits
     sig.returns.push(AbiParam::new(types::I64)); // result
 
@@ -966,18 +1033,13 @@ fn create_mw_next(
     Ok(func_id)
 }
 
-fn build_signature(module: &mut JITModule, param_count: usize) -> cranelift_codegen::ir::Signature {
+fn build_signature(
+    module: &mut JITModule,
+    param_count: usize,
+    call_conv: CallConv,
+) -> cranelift_codegen::ir::Signature {
     let mut sig = module.make_signature();
-    // Tail CC for all language-internal functions (per cranelift-guide.md §6, §10).
-    // Enables guaranteed tail call elimination via return_call, at performance
-    // parity with SystemV for non-tail calls. The host entry point uses a
-    // platform-CC wrapper (__entry_wrapper) to avoid ABI mismatch on transmute.
-    // Tail CC for all language-internal functions. Enables guaranteed tail call
-    // elimination via return_call. The host entry point uses a platform-CC
-    // wrapper (__entry_wrapper), and runtime helpers that call JIT functions
-    // indirectly (call_jit_fn, jit_call_indirect) use per-arity trampolines
-    // that bridge platform CC → Tail CC via Cranelift indirect calls.
-    sig.call_conv = CallConv::Tail;
+    sig.call_conv = call_conv;
     for _ in 0..param_count {
         sig.params.push(AbiParam::new(types::I64));
     }
@@ -991,9 +1053,10 @@ fn build_signature_multireturn(
     module: &mut JITModule,
     param_count: usize,
     return_count: usize,
+    call_conv: CallConv,
 ) -> cranelift_codegen::ir::Signature {
     let mut sig = module.make_signature();
-    sig.call_conv = CallConv::Tail;
+    sig.call_conv = call_conv;
     for _ in 0..param_count {
         sig.params.push(AbiParam::new(types::I64));
     }
@@ -1099,8 +1162,14 @@ pub(super) fn make_helper_sig<M: Module>(
             sig.params.push(AbiParam::new(types::I64));
             sig.returns.push(AbiParam::new(types::I64));
         }
-        "jit_string_reverse" | "jit_enum_tag_id" | "jit_enum_payload" | "jit_list_length"
-        | "jit_is_err" | "jit_is_none" | "jit_int_from_i64" | "jit_int_neg"
+        "jit_string_reverse"
+        | "jit_enum_tag_id"
+        | "jit_enum_payload"
+        | "jit_list_length"
+        | "jit_is_err"
+        | "jit_is_none"
+        | "jit_int_from_i64"
+        | "jit_int_neg"
         | "jit_middleware_dispatch" => {
             // (val) -> u64
             sig.params.push(AbiParam::new(types::I64));
@@ -1202,6 +1271,9 @@ pub(super) fn make_helper_sig<M: Module>(
         "jit_set_rc_mode_raw" => {
             // (enabled: i64) -> void
             sig.params.push(AbiParam::new(types::I64));
+        }
+        "jit_counter_helper_call" | "jit_counter_box_boundary" | "jit_counter_unbox_boundary" => {
+            // () -> void
         }
         // Perceus reuse helpers
         "jit_drop_reuse"

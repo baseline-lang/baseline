@@ -42,7 +42,7 @@ enum Commands {
         /// The file to run
         file: PathBuf,
 
-        /// Print heap allocation statistics after execution
+        /// Print heap and JIT runtime counter statistics after execution
         #[arg(long)]
         mem_stats: bool,
 
@@ -224,10 +224,13 @@ fn main() {
         } => {
             vm::natives::set_program_args(program_args);
             vm::natives::set_fs_sandbox(fs_sandbox);
+            baseline_rt::helpers::jit_counter_reset();
             run_file_jit(&file);
             if mem_stats {
                 let stats = vm::nvalue::alloc_stats();
                 eprintln!("[mem] {}", stats);
+                let jit_stats = baseline_rt::helpers::jit_counter_snapshot();
+                eprintln!("[jit] {}", jit_stats);
             }
         }
         Commands::Test { file, json, aot } => {

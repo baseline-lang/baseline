@@ -69,6 +69,8 @@ pub(super) struct FnCompileCtx<'a, 'b, M: Module> {
     pub(super) rc_scope_stack: Vec<Vec<Variable>>,
     /// Calling convention for Baseline functions (Tail for JIT, Fast for AOT).
     pub(super) func_call_conv: CallConv,
+    /// Whether runtime profiling counters are emitted into generated code.
+    pub(super) jit_counters_enabled: bool,
     /// Multi-return: sorted field names for functions returning all-scalar records.
     /// When set, the function uses N return registers instead of a single boxed record.
     pub(super) multireturn_fields: Option<Vec<String>>,
@@ -78,6 +80,53 @@ pub(super) struct FnCompileCtx<'a, 'b, M: Module> {
 }
 
 pub(super) type CValue = cranelift_codegen::ir::Value;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropReuseKind {
+    Enum,
+    Tuple,
+    Record,
+    Struct,
+}
+
+fn drop_reuse_kind_in_expr(expr: &Expr) -> Option<DropReuseKind> {
+    match expr {
+        Expr::Reuse { alloc, .. } => match alloc.as_ref() {
+            Expr::MakeEnum { .. } => Some(DropReuseKind::Enum),
+            Expr::MakeTuple(_, _) => Some(DropReuseKind::Tuple),
+            Expr::MakeRecord(_, _) => Some(DropReuseKind::Record),
+            Expr::MakeStruct { .. } => Some(DropReuseKind::Struct),
+            _ => None,
+        },
+        Expr::Block(exprs, _) if !exprs.is_empty() => {
+            drop_reuse_kind_in_expr(exprs.last().unwrap())
+        }
+        Expr::If {
+            then_branch,
+            else_branch: Some(else_branch),
+            ..
+        } => {
+            let then_kind = drop_reuse_kind_in_expr(then_branch)?;
+            let else_kind = drop_reuse_kind_in_expr(else_branch)?;
+            if then_kind == else_kind {
+                Some(then_kind)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn drop_reuse_helper_name(body: &Expr) -> &'static str {
+    match drop_reuse_kind_in_expr(body) {
+        Some(DropReuseKind::Enum) => "jit_drop_reuse_enum",
+        Some(DropReuseKind::Tuple) => "jit_drop_reuse_tuple",
+        Some(DropReuseKind::Record) => "jit_drop_reuse_record",
+        Some(DropReuseKind::Struct) => "jit_drop_reuse_struct",
+        None => "jit_drop_reuse",
+    }
+}
 
 impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
     pub(super) fn new_var(&mut self) -> Variable {
@@ -386,7 +435,9 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                         .map(|a| Self::count_param_field_reads(a, param_name))
                         .sum::<usize>()
             }
-            Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => Self::count_param_field_reads(value, param_name),
+            Expr::Let { value, .. }
+            | Expr::Assign { value, .. }
+            | Expr::FieldAssign { value, .. } => Self::count_param_field_reads(value, param_name),
             Expr::Block(exprs, _) | Expr::MakeList(exprs, _) | Expr::MakeTuple(exprs, _) => exprs
                 .iter()
                 .map(|e| Self::count_param_field_reads(e, param_name))
@@ -536,40 +587,38 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
 
     /// Infer parameter types from Var references in the function body.
     /// Scans for Var(name, Some(type)) where name matches a param.
-    fn infer_param_types<'e>(
-        body: &'e Expr,
-        params: &[String],
-    ) -> HashMap<&'e str, Type> {
+    fn infer_param_types<'e>(body: &'e Expr, params: &[String]) -> HashMap<&'e str, Type> {
         let mut result = HashMap::new();
         Self::collect_var_types(body, params, &mut result);
         result
     }
 
-    fn collect_var_types<'e>(
-        expr: &'e Expr,
-        params: &[String],
-        out: &mut HashMap<&'e str, Type>,
-    ) {
+    fn collect_var_types<'e>(expr: &'e Expr, params: &[String], out: &mut HashMap<&'e str, Type>) {
         match expr {
             Expr::Var(name, Some(ty)) if params.iter().any(|p| p == name) => {
                 out.entry(name.as_str()).or_insert_with(|| ty.clone());
             }
             Expr::GetField { object, .. } => Self::collect_var_types(object, params, out),
-            Expr::BinOp { lhs, rhs, .. }
-            | Expr::And(lhs, rhs)
-            | Expr::Or(lhs, rhs) => {
+            Expr::BinOp { lhs, rhs, .. } | Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
                 Self::collect_var_types(lhs, params, out);
                 Self::collect_var_types(rhs, params, out);
             }
             Expr::UnaryOp { operand, .. } => Self::collect_var_types(operand, params, out),
-            Expr::If { condition, then_branch, else_branch, .. } => {
+            Expr::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 Self::collect_var_types(condition, params, out);
                 Self::collect_var_types(then_branch, params, out);
                 if let Some(e) = else_branch {
                     Self::collect_var_types(e, params, out);
                 }
             }
-            Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => {
+            Expr::Let { value, .. }
+            | Expr::Assign { value, .. }
+            | Expr::FieldAssign { value, .. } => {
                 Self::collect_var_types(value, params, out);
             }
             Expr::Block(exprs, _) => {
@@ -717,8 +766,20 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         self.call_helper_void("jit_rc_decref", &[val]);
     }
 
+    fn emit_counter_call(&mut self, counter_helper: &str) {
+        if !self.jit_counters_enabled || !self.helper_ids.contains_key(counter_helper) {
+            return;
+        }
+        let func_id = self.helper_ids[counter_helper];
+        let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
+        self.builder.ins().call(func_ref, &[]);
+    }
+
     /// Call a runtime helper that returns no useful value.
     pub(super) fn call_helper_void(&mut self, name: &str, args: &[CValue]) {
+        if name != "jit_counter_helper_call" {
+            self.emit_counter_call("jit_counter_helper_call");
+        }
         let func_id = self.helper_ids[name];
         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
         self.builder.ins().call(func_ref, args);
@@ -849,6 +910,37 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         self.builder.ins().bor(extended, tag)
     }
 
+    /// Convert boxed scalar to raw value for an unboxed callee boundary.
+    fn unbox_for_unboxed_boundary(&mut self, boxed: CValue, ty: Option<&Type>) -> CValue {
+        self.emit_counter_call("jit_counter_unbox_boundary");
+        match ty {
+            Some(Type::Int) => self.untag_int(boxed),
+            Some(Type::Bool) => {
+                let one = self.builder.ins().iconst(types::I64, 1);
+                self.builder.ins().band(boxed, one)
+            }
+            Some(Type::Unit) => self.builder.ins().iconst(types::I64, 0),
+            Some(Type::Float) => boxed, // Float NValues are already raw IEEE bits.
+            _ => self.untag_int(boxed),
+        }
+    }
+
+    /// Convert raw scalar to boxed NValue for a boxed caller boundary.
+    fn box_for_boxed_boundary(&mut self, raw: CValue, ty: Option<&Type>) -> CValue {
+        self.emit_counter_call("jit_counter_box_boundary");
+        match ty {
+            Some(Type::Int) => self.tag_int_checked(raw),
+            Some(Type::Bool) => {
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let cmp = self.builder.ins().icmp(IntCC::NotEqual, raw, zero);
+                self.tag_bool(cmp)
+            }
+            Some(Type::Unit) => self.builder.ins().iconst(types::I64, NV_UNIT as i64),
+            Some(Type::Float) => raw, // Float NValues are already raw IEEE bits.
+            _ => self.tag_int_checked(raw),
+        }
+    }
+
     /// Check if a NaN-boxed value is truthy (bit 0 set, works for NaN-boxed bools).
     pub(super) fn is_truthy(&mut self, val: CValue) -> CValue {
         let one = self.builder.ins().iconst(types::I64, 1);
@@ -882,6 +974,9 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
 
     /// Call a runtime helper function by name.
     pub(super) fn call_helper(&mut self, name: &str, args: &[CValue]) -> CValue {
+        if name != "jit_counter_helper_call" {
+            self.emit_counter_call("jit_counter_helper_call");
+        }
         let func_id = self.helper_ids[name];
         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, args);
@@ -908,6 +1003,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         &mut self,
         name: &str,
         ir_args: &[Expr],
+        call_ty: Option<&Type>,
     ) -> Result<Option<CValue>, String> {
         let func_idx = match self.func_names.get(name) {
             Some(&idx) => idx,
@@ -1003,11 +1099,16 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
         let callee_unboxed = func_idx < self.unboxed_flags.len() && self.unboxed_flags[func_idx];
         let call_result = if callee_unboxed {
-            // Callee expects raw i64: untag args, tag result
-            let untagged_args: Vec<CValue> = arg_vals.iter().map(|&v| self.untag_int(v)).collect();
-            let call = self.builder.ins().call(func_ref, &untagged_args);
+            // Boxed -> unboxed boundary: convert args to raw scalar representation.
+            let param_types = self.ir_functions[func_idx].param_types.clone();
+            let mut raw_args = Vec::with_capacity(arg_vals.len());
+            for (idx, boxed) in arg_vals.iter().copied().enumerate() {
+                let ty = param_types.get(idx).and_then(|t| t.as_ref());
+                raw_args.push(self.unbox_for_unboxed_boundary(boxed, ty));
+            }
+            let call = self.builder.ins().call(func_ref, &raw_args);
             let raw = self.builder.inst_results(call)[0];
-            self.tag_int_checked(raw)
+            self.box_for_boxed_boundary(raw, call_ty)
         } else {
             let call = self.builder.ins().call(func_ref, &arg_vals);
             self.builder.inst_results(call)[0]
@@ -1169,7 +1270,11 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 Ok(self.builder.ins().iconst(types::I64, 0))
             }
 
-            Expr::FieldAssign { object, field, value } => {
+            Expr::FieldAssign {
+                object,
+                field,
+                value,
+            } => {
                 // SRA fast path
                 if let Some(field_vars) = self.sra_records.get(object.as_str()) {
                     if let Some(&fvar) = field_vars.get(field.as_str()) {
@@ -1194,7 +1299,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 Ok(result)
             }
 
-            Expr::CallDirect { name, args, .. } => {
+            Expr::CallDirect { name, args, ty } => {
                 // Try base-case speculation first (unboxed mode)
                 if let Some(val) = self.try_speculate_call_unboxed(name, args)? {
                     return Ok(val);
@@ -1215,17 +1320,17 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                             let call = self.builder.ins().call(func_ref, &arg_vals);
                             Ok(self.builder.inst_results(call)[0])
                         } else {
-                            // Unboxed → boxed: tag args, untag result
-                            let arg_vals: Vec<CValue> = args
-                                .iter()
-                                .map(|a| {
-                                    let raw = self.compile_expr_unboxed(a)?;
-                                    Ok(self.tag_int_checked(raw))
-                                })
-                                .collect::<Result<Vec<_>, String>>()?;
+                            // Unboxed -> boxed boundary: box args using callee param types.
+                            let param_types = self.ir_functions[func_idx].param_types.clone();
+                            let mut arg_vals = Vec::with_capacity(args.len());
+                            for (idx, arg) in args.iter().enumerate() {
+                                let raw = self.compile_expr_unboxed(arg)?;
+                                let expected = param_types.get(idx).and_then(|t| t.as_ref());
+                                arg_vals.push(self.box_for_boxed_boundary(raw, expected));
+                            }
                             let call = self.builder.ins().call(func_ref, &arg_vals);
                             let boxed_result = self.builder.inst_results(call)[0];
-                            Ok(self.untag_int(boxed_result))
+                            Ok(self.unbox_for_unboxed_boundary(boxed_result, ty.as_ref()))
                         }
                     } else {
                         Err(format!(
@@ -1238,7 +1343,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 }
             }
 
-            Expr::TailCall { name, args, .. } => {
+            Expr::TailCall { name, args, ty } => {
                 if name == &self.current_func_name
                     && let Some(loop_header) = self.loop_header
                 {
@@ -1269,28 +1374,34 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
 
                         if callee_unboxed {
-                            // Both unboxed — use return_call for guaranteed TCE
                             let arg_vals: Vec<CValue> = args
                                 .iter()
                                 .map(|a| self.compile_expr_unboxed(a))
                                 .collect::<Result<Vec<_>, _>>()?;
-                            self.builder.ins().return_call(func_ref, &arg_vals);
+                            if self.func_call_conv == CallConv::Tail {
+                                // Tail CC: use return_call for guaranteed TCE.
+                                self.builder.ins().return_call(func_ref, &arg_vals);
 
-                            let dead_block = self.builder.create_block();
-                            self.builder.switch_to_block(dead_block);
-                            self.builder.seal_block(dead_block);
-                            Ok(self.builder.ins().iconst(types::I64, 0))
+                                let dead_block = self.builder.create_block();
+                                self.builder.switch_to_block(dead_block);
+                                self.builder.seal_block(dead_block);
+                                Ok(self.builder.ins().iconst(types::I64, 0))
+                            } else {
+                                // Non-tail CC: regular call + return.
+                                let call = self.builder.ins().call(func_ref, &arg_vals);
+                                Ok(self.builder.inst_results(call)[0])
+                            }
                         } else {
-                            let arg_vals: Vec<CValue> = args
-                                .iter()
-                                .map(|a| {
-                                    let raw = self.compile_expr_unboxed(a)?;
-                                    Ok(self.tag_int_checked(raw))
-                                })
-                                .collect::<Result<Vec<_>, String>>()?;
+                            let param_types = self.ir_functions[func_idx].param_types.clone();
+                            let mut arg_vals = Vec::with_capacity(args.len());
+                            for (idx, arg) in args.iter().enumerate() {
+                                let raw = self.compile_expr_unboxed(arg)?;
+                                let expected = param_types.get(idx).and_then(|t| t.as_ref());
+                                arg_vals.push(self.box_for_boxed_boundary(raw, expected));
+                            }
                             let call = self.builder.ins().call(func_ref, &arg_vals);
                             let boxed_result = self.builder.inst_results(call)[0];
-                            Ok(self.untag_int(boxed_result))
+                            Ok(self.unbox_for_unboxed_boundary(boxed_result, ty.as_ref()))
                         }
                     } else {
                         Err(format!(
@@ -1775,8 +1886,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     && bind_name == base_name
                     && self.vars.contains_key(bind_name)
                 {
-                    let val =
-                        self.compile_update_record_consuming(value, bind_name)?;
+                    let val = self.compile_update_record_consuming(value, bind_name)?;
                     self.bind_pattern_rc(pattern, val)?;
                 } else {
                     let val = self.compile_expr(value)?;
@@ -1802,7 +1912,11 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 Ok(self.builder.ins().iconst(types::I64, NV_UNIT as i64))
             }
 
-            Expr::FieldAssign { object, field, value } => {
+            Expr::FieldAssign {
+                object,
+                field,
+                value,
+            } => {
                 let val = self.compile_expr(value)?;
                 // SRA fast path: if object is scalar-replaced, just update the field variable
                 if let Some(field_vars) = self.sra_records.get(object.as_str()) {
@@ -1843,8 +1957,13 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
 
             Expr::Block(exprs, _) => {
                 // SRA: find non-escaping record bindings and track them
-                let self_fn = if self.loop_header.is_some() { Some(self.current_func_name.as_str()) } else { None };
-                let sra_candidates = Self::find_sra_candidates_with_existing(exprs, &self.sra_records, self_fn);
+                let self_fn = if self.loop_header.is_some() {
+                    Some(self.current_func_name.as_str())
+                } else {
+                    None
+                };
+                let sra_candidates =
+                    Self::find_sra_candidates_with_existing(exprs, &self.sra_records, self_fn);
                 let sra_names: std::collections::HashSet<&str> =
                     sra_candidates.iter().map(|(n, _)| n.as_str()).collect();
                 self.push_rc_scope();
@@ -1858,7 +1977,13 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     }
                     result = self.compile_expr(e)?;
                     // RC: decref intermediate results (not the last expression)
-                    if self.rc_enabled && !is_last && !matches!(e, Expr::Let { .. } | Expr::Assign { .. } | Expr::FieldAssign { .. }) {
+                    if self.rc_enabled
+                        && !is_last
+                        && !matches!(
+                            e,
+                            Expr::Let { .. } | Expr::Assign { .. } | Expr::FieldAssign { .. }
+                        )
+                    {
                         self.emit_decref(result);
                     }
                 }
@@ -1874,8 +1999,8 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 Ok(result)
             }
 
-            Expr::CallDirect { name, args, .. } => {
-                if let Some(val) = self.try_speculate_call(name, args)? {
+            Expr::CallDirect { name, args, ty } => {
+                if let Some(val) = self.try_speculate_call(name, args, ty.as_ref())? {
                     return Ok(val);
                 }
 
@@ -1886,16 +2011,20 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                         let func_ref = self.module.declare_func_in_func(func_id, self.builder.func);
 
                         if callee_unboxed {
-                            // Boxed → unboxed: untag args, tag result
+                            // Boxed -> unboxed boundary: convert args to raw scalar representation.
                             let arg_vals = self.compile_exprs_stashed(args)?;
-                            let arg_vals: Vec<CValue> = arg_vals
-                                .into_iter()
-                                .map(|boxed| self.untag_int(boxed))
-                                .collect();
-                            let call = self.builder.ins().call(func_ref, &arg_vals);
+                            let param_types = self.ir_functions[func_idx].param_types.clone();
+                            let mut raw_args = Vec::with_capacity(arg_vals.len());
+                            for (idx, boxed) in arg_vals.into_iter().enumerate() {
+                                let expected = param_types.get(idx).and_then(|t| t.as_ref());
+                                raw_args.push(self.unbox_for_unboxed_boundary(boxed, expected));
+                            }
+                            let call = self.builder.ins().call(func_ref, &raw_args);
                             let raw_result = self.builder.inst_results(call)[0];
-                            Ok(self.tag_int_checked(raw_result))
-                        } else if let Some(ref field_names) = self.multireturn_info.get(func_idx).and_then(|x| x.as_ref()) {
+                            Ok(self.box_for_boxed_boundary(raw_result, ty.as_ref()))
+                        } else if let Some(ref field_names) =
+                            self.multireturn_info.get(func_idx).and_then(|x| x.as_ref())
+                        {
                             // Multi-return callee: receive N values, reconstruct boxed record
                             let arg_vals = self.compile_exprs_stashed(args)?;
                             let call = self.builder.ins().call(func_ref, &arg_vals);
@@ -1910,7 +2039,10 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                                 pair_vals.push(field_vals[idx]);
                             }
                             let addr = self.spill_to_stack(&pair_vals);
-                            let count = self.builder.ins().iconst(types::I64, field_names.len() as i64);
+                            let count = self
+                                .builder
+                                .ins()
+                                .iconst(types::I64, field_names.len() as i64);
                             Ok(self.call_helper("jit_make_record", &[addr, count]))
                         } else {
                             let arg_vals = self.compile_exprs_stashed(args)?;
@@ -1928,7 +2060,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 }
             }
 
-            Expr::TailCall { name, args, .. } => {
+            Expr::TailCall { name, args, ty } => {
                 if name == &self.current_func_name
                     && let Some(loop_header) = self.loop_header
                 {
@@ -1973,22 +2105,30 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
 
                         if callee_unboxed {
                             let arg_vals = self.compile_exprs_stashed(args)?;
-                            let arg_vals: Vec<CValue> = arg_vals
-                                .into_iter()
-                                .map(|boxed| self.untag_int(boxed))
-                                .collect();
-                            let call = self.builder.ins().call(func_ref, &arg_vals);
+                            let param_types = self.ir_functions[func_idx].param_types.clone();
+                            let mut raw_args = Vec::with_capacity(arg_vals.len());
+                            for (idx, boxed) in arg_vals.into_iter().enumerate() {
+                                let expected = param_types.get(idx).and_then(|t| t.as_ref());
+                                raw_args.push(self.unbox_for_unboxed_boundary(boxed, expected));
+                            }
+                            let call = self.builder.ins().call(func_ref, &raw_args);
                             let raw_result = self.builder.inst_results(call)[0];
-                            Ok(self.tag_int_checked(raw_result))
+                            Ok(self.box_for_boxed_boundary(raw_result, ty.as_ref()))
                         } else {
-                            // Both boxed — use return_call for guaranteed TCE
                             let arg_vals = self.compile_exprs_stashed(args)?;
-                            self.builder.ins().return_call(func_ref, &arg_vals);
+                            if self.func_call_conv == CallConv::Tail {
+                                // Tail CC: use return_call for guaranteed TCE.
+                                self.builder.ins().return_call(func_ref, &arg_vals);
 
-                            let dead_block = self.builder.create_block();
-                            self.builder.switch_to_block(dead_block);
-                            self.builder.seal_block(dead_block);
-                            Ok(self.builder.ins().iconst(types::I64, NV_UNIT as i64))
+                                let dead_block = self.builder.create_block();
+                                self.builder.switch_to_block(dead_block);
+                                self.builder.seal_block(dead_block);
+                                Ok(self.builder.ins().iconst(types::I64, NV_UNIT as i64))
+                            } else {
+                                // Non-tail CC: regular call + return.
+                                let call = self.builder.ins().call(func_ref, &arg_vals);
+                                Ok(self.builder.inst_results(call)[0])
+                            }
                         }
                     } else {
                         Err(format!(
@@ -2168,6 +2308,20 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     }
                     // Nullary: MakeEnum { payload: Unit } → baked constant
                     if matches!(payload.as_ref(), Expr::Unit) {
+                        // AOT cannot bake process-local heap pointers into object code.
+                        // Build nullary enums at runtime when compiling AOT.
+                        if self.aot_strings.is_some() {
+                            let tag_val = self.emit_string_value(tag)?;
+                            let id_val = self.builder.ins().iconst(types::I64, id as i64);
+                            // count=0, but provide a valid non-null pointer for from_raw_parts.
+                            let dummy = self.builder.ins().iconst(types::I64, NV_UNIT as i64);
+                            let addr = self.spill_to_stack(&[dummy]);
+                            let count = self.builder.ins().iconst(types::I64, 0);
+                            return Ok(self.call_helper(
+                                "jit_make_enum_flat",
+                                &[tag_val, id_val, addr, count],
+                            ));
+                        }
                         let tag_str: RcStr = tag.as_str().into();
                         let nv = NValue::enum_val_flat(tag_str, id, vec![]);
                         return Ok(self.emit_heap_nvalue(nv));
@@ -2602,8 +2756,10 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                     return Err(format!("Drop: unknown variable '{}'", name));
                 };
 
-                // Call jit_drop_reuse to drain inner fields, get reuse token
-                let reuse_bits = self.call_helper("jit_drop_reuse", &[var_val]);
+                // Drop specialization: when the continuation is a shape-stable
+                // Reuse constructor, call the specialized drop helper.
+                let drop_helper = drop_reuse_helper_name(body);
+                let reuse_bits = self.call_helper(drop_helper, &[var_val]);
 
                 // Null out the consumed variable so function-level pop_rc_scope
                 // decrefs UNIT (a no-op) instead of the reused allocation.
@@ -2729,10 +2885,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         expr: &Expr,
         base_name: &str,
     ) -> Result<CValue, String> {
-        let Expr::UpdateRecord {
-            updates, ty, ..
-        } = expr
-        else {
+        let Expr::UpdateRecord { updates, ty, .. } = expr else {
             return self.compile_expr(expr);
         };
 
@@ -2764,10 +2917,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
             // Null out old variable BEFORE calling helper — prevents double-free
             // at scope exit (the old var is tracked in RC scope, decref of NV_UNIT
             // is a no-op).
-            let null_val = self
-                .builder
-                .ins()
-                .iconst(types::I64, NV_UNIT as i64);
+            let null_val = self.builder.ins().iconst(types::I64, NV_UNIT as i64);
             self.builder.def_var(base_var, null_val);
 
             if idxs.len() == 3 {
@@ -2796,10 +2946,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
             }
             let addr = self.spill_to_stack(&pair_vals);
             let count = self.builder.ins().iconst(types::I64, updates.len() as i64);
-            Ok(self.call_helper(
-                "jit_update_record_indexed",
-                &[base_val, addr, count],
-            ))
+            Ok(self.call_helper("jit_update_record_indexed", &[base_val, addr, count]))
         } else {
             // Fallback: string-based. Null first, then call.
             let mut pair_vals = Vec::with_capacity(updates.len() * 2);
@@ -2810,10 +2957,7 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 pair_vals.push(key_val);
                 pair_vals.push(val);
             }
-            let null_val = self
-                .builder
-                .ins()
-                .iconst(types::I64, NV_UNIT as i64);
+            let null_val = self.builder.ins().iconst(types::I64, NV_UNIT as i64);
             self.builder.def_var(base_var, null_val);
             let addr = self.spill_to_stack(&pair_vals);
             let count = self.builder.ins().iconst(types::I64, updates.len() as i64);
@@ -3064,5 +3208,64 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         let false_val = self.builder.ins().iconst(types::I64, NV_FALSE as i64);
         let cmp = self.builder.ins().icmp(IntCC::Equal, a, b);
         Ok(self.builder.ins().select(cmp, true_val, false_val))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drop_reuse_helper_name;
+    use crate::vm::ir::Expr;
+
+    fn reuse(alloc: Expr) -> Expr {
+        Expr::Reuse {
+            token: "_reuse".to_string(),
+            alloc: Box::new(alloc),
+        }
+    }
+
+    #[test]
+    fn drop_helper_specializes_enum() {
+        let body = reuse(Expr::MakeEnum {
+            tag: "Some".to_string(),
+            payload: Box::new(Expr::Int(1)),
+            ty: None,
+        });
+        assert_eq!(drop_reuse_helper_name(&body), "jit_drop_reuse_enum");
+    }
+
+    #[test]
+    fn drop_helper_specializes_tuple_in_block_tail() {
+        let body = Expr::Block(
+            vec![
+                Expr::Int(0),
+                reuse(Expr::MakeTuple(vec![Expr::Int(1)], None)),
+            ],
+            None,
+        );
+        assert_eq!(drop_reuse_helper_name(&body), "jit_drop_reuse_tuple");
+    }
+
+    #[test]
+    fn drop_helper_requires_matching_if_branch_shapes() {
+        let body = Expr::If {
+            condition: Box::new(Expr::Bool(true)),
+            then_branch: Box::new(reuse(Expr::MakeTuple(vec![Expr::Int(1)], None))),
+            else_branch: Some(Box::new(reuse(Expr::MakeRecord(
+                vec![("x".to_string(), Expr::Int(2))],
+                None,
+            )))),
+            ty: None,
+        };
+        assert_eq!(drop_reuse_helper_name(&body), "jit_drop_reuse");
+    }
+
+    #[test]
+    fn drop_helper_specializes_struct() {
+        let body = reuse(Expr::MakeStruct {
+            name: "Node".to_string(),
+            fields: vec![("left".to_string(), Expr::Int(1))],
+            ty: None,
+        });
+        assert_eq!(drop_reuse_helper_name(&body), "jit_drop_reuse_struct");
     }
 }

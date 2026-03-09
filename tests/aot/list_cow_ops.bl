@@ -1,0 +1,12 @@
+@prelude(core)
+
+fn main() -> Int = {
+  let xs = [3, 1, 2]
+  let rev = List.reverse(xs)
+  let sorted = List.sort(rev)
+  let ys = [4, 5]
+  let joined = List.concat(sorted, ys)
+  let first = Option.unwrap_or(List.head(joined), 0)
+  let last = Option.unwrap_or(List.head(List.reverse(joined)), 0)
+  List.length(joined) + first + last
+}

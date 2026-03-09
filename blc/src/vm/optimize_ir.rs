@@ -124,6 +124,8 @@ fn optimize_inner(module: &mut IrModule, lift: bool) {
         evidence_transform(module);
         // Lambda lifting: transform Lambda nodes into MakeClosure + lifted functions
         lift_lambdas(module);
+        // Tail recursion modulo constructor (strict first pass).
+        apply_trmc_transform(module);
         // Perceus reuse analysis: insert Drop/Reuse for match-destructure-reconstruct
         insert_drop_reuse(module);
     }
@@ -1047,6 +1049,479 @@ fn insert_drop_reuse(module: &mut IrModule) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tail recursion modulo constructor (strict pass)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct TrmcCandidate {
+    subject_name: String,
+    recursive_arm_index: usize,
+    constructor_tag: String,
+    non_recursive_fields: Vec<Expr>,
+    recursive_args: Vec<Expr>,
+    recursive_prefix: Vec<Expr>,
+}
+
+#[derive(Debug, Clone)]
+struct TrmcRewrite {
+    wrapper_body: Expr,
+    loop_fn: IrFunction,
+    build_fn: IrFunction,
+}
+
+fn apply_trmc_transform(module: &mut IrModule) {
+    let mut used_fn_names: HashSet<String> =
+        module.functions.iter().map(|f| f.name.clone()).collect();
+    let mut generated: Vec<IrFunction> = Vec::new();
+
+    for func in &mut module.functions {
+        let Some(rewrite) = try_trmc_rewrite(func, &used_fn_names) else {
+            continue;
+        };
+
+        used_fn_names.insert(rewrite.loop_fn.name.clone());
+        used_fn_names.insert(rewrite.build_fn.name.clone());
+        func.body = rewrite.wrapper_body;
+        generated.push(rewrite.loop_fn);
+        generated.push(rewrite.build_fn);
+    }
+
+    module.functions.extend(generated);
+}
+
+fn try_trmc_rewrite(func: &IrFunction, used_fn_names: &HashSet<String>) -> Option<TrmcRewrite> {
+    let candidate = detect_trmc_candidate(func)?;
+    if candidate.recursive_args.len() != func.params.len() {
+        return None;
+    }
+
+    let loop_name = format!("{}__trmc_loop", func.name);
+    let build_name = format!("{}__trmc_build", func.name);
+    if used_fn_names.contains(&loop_name) || used_fn_names.contains(&build_name) {
+        return None;
+    }
+
+    let suffix = sanitize_symbol_name(&func.name);
+    let frame_nil_tag = format!("__trmc_nil_{}", suffix);
+    let frame_cons_tag = format!("__trmc_cons_{}", suffix);
+
+    let frames_param = "__trmc_frames".to_string();
+    let acc_param = "__trmc_acc".to_string();
+    let token_name = "__trmc_token".to_string();
+
+    let wrapper_body = make_trmc_wrapper_body(func, &loop_name, &frame_nil_tag);
+    let loop_fn = make_trmc_loop_function(
+        func,
+        &candidate,
+        &loop_name,
+        &build_name,
+        &frame_cons_tag,
+        &frames_param,
+        &token_name,
+    )?;
+    let build_fn = make_trmc_build_function(
+        func,
+        &candidate,
+        &build_name,
+        &frame_nil_tag,
+        &frame_cons_tag,
+        &frames_param,
+        &acc_param,
+    );
+
+    Some(TrmcRewrite {
+        wrapper_body,
+        loop_fn,
+        build_fn,
+    })
+}
+
+fn sanitize_symbol_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() { "_".to_string() } else { out }
+}
+
+fn make_trmc_wrapper_body(func: &IrFunction, loop_name: &str, frame_nil_tag: &str) -> Expr {
+    let mut args = Vec::with_capacity(func.params.len() + 1);
+    args.push(Expr::MakeEnum {
+        tag: frame_nil_tag.to_string(),
+        payload: Box::new(Expr::Unit),
+        ty: None,
+    });
+    args.extend(param_vars(func));
+    Expr::CallDirect {
+        name: loop_name.to_string(),
+        args,
+        ty: func.ty.clone(),
+    }
+}
+
+fn make_trmc_loop_function(
+    func: &IrFunction,
+    candidate: &TrmcCandidate,
+    loop_name: &str,
+    build_name: &str,
+    frame_cons_tag: &str,
+    frames_param: &str,
+    token_name: &str,
+) -> Option<IrFunction> {
+    let Expr::Match { subject, arms, ty } = &func.body else {
+        return None;
+    };
+
+    let mut rewritten_arms = Vec::with_capacity(arms.len());
+    for (idx, arm) in arms.iter().cloned().enumerate() {
+        if idx == candidate.recursive_arm_index {
+            let recursive_body = make_trmc_recursive_arm_body(
+                &candidate.subject_name,
+                loop_name,
+                frame_cons_tag,
+                frames_param,
+                token_name,
+                &candidate.non_recursive_fields,
+                &candidate.recursive_args,
+                &candidate.recursive_prefix,
+                &func.ty,
+            );
+            rewritten_arms.push(MatchArm {
+                pattern: arm.pattern,
+                guard: arm.guard,
+                body: recursive_body,
+            });
+        } else {
+            rewritten_arms.push(MatchArm {
+                pattern: arm.pattern,
+                guard: arm.guard,
+                body: Expr::TailCall {
+                    name: build_name.to_string(),
+                    args: vec![Expr::Var(frames_param.to_string(), None), arm.body],
+                    ty: func.ty.clone(),
+                },
+            });
+        }
+    }
+
+    let mut params = Vec::with_capacity(func.params.len() + 1);
+    params.push(frames_param.to_string());
+    params.extend(func.params.iter().cloned());
+
+    let mut param_types = Vec::with_capacity(func.param_types.len() + 1);
+    param_types.push(None);
+    param_types.extend(func.param_types.iter().cloned());
+
+    Some(IrFunction {
+        name: loop_name.to_string(),
+        params,
+        body: Expr::Match {
+            subject: subject.clone(),
+            arms: rewritten_arms,
+            ty: ty.clone(),
+        },
+        ty: func.ty.clone(),
+        param_types,
+        span: func.span.clone(),
+    })
+}
+
+fn make_trmc_recursive_arm_body(
+    subject_name: &str,
+    loop_name: &str,
+    frame_cons_tag: &str,
+    frames_param: &str,
+    token_name: &str,
+    non_recursive_fields: &[Expr],
+    recursive_args: &[Expr],
+    recursive_prefix: &[Expr],
+    ret_ty: &Option<crate::analysis::types::Type>,
+) -> Expr {
+    let mut stmts = recursive_prefix.to_vec();
+
+    let mut frame_field_vars = Vec::with_capacity(non_recursive_fields.len());
+    for (idx, field_expr) in non_recursive_fields.iter().enumerate() {
+        let tmp = format!("__trmc_field_{}", idx);
+        frame_field_vars.push(tmp.clone());
+        stmts.push(Expr::Let {
+            pattern: Box::new(Pattern::Var(tmp.clone())),
+            value: Box::new(field_expr.clone()),
+            ty: None,
+        });
+    }
+
+    let mut recursive_arg_vars = Vec::with_capacity(recursive_args.len());
+    for (idx, arg_expr) in recursive_args.iter().enumerate() {
+        let tmp = format!("__trmc_arg_{}", idx);
+        recursive_arg_vars.push(tmp.clone());
+        stmts.push(Expr::Let {
+            pattern: Box::new(Pattern::Var(tmp.clone())),
+            value: Box::new(arg_expr.clone()),
+            ty: None,
+        });
+    }
+
+    let mut frame_items = Vec::with_capacity(frame_field_vars.len() + 2);
+    frame_items.extend(
+        frame_field_vars
+            .iter()
+            .map(|name| Expr::Var(name.clone(), None)),
+    );
+    frame_items.push(Expr::Var(token_name.to_string(), None));
+    frame_items.push(Expr::Var(frames_param.to_string(), None));
+
+    let frame_push = Expr::MakeEnum {
+        tag: frame_cons_tag.to_string(),
+        payload: Box::new(make_payload_expr(frame_items)),
+        ty: None,
+    };
+
+    let mut tail_args = Vec::with_capacity(recursive_arg_vars.len() + 1);
+    tail_args.push(frame_push);
+    tail_args.extend(
+        recursive_arg_vars
+            .iter()
+            .map(|name| Expr::Var(name.clone(), None)),
+    );
+    let tail = Expr::TailCall {
+        name: loop_name.to_string(),
+        args: tail_args,
+        ty: ret_ty.clone(),
+    };
+
+    stmts.push(Expr::Drop {
+        name: subject_name.to_string(),
+        token: Some(token_name.to_string()),
+        body: Box::new(tail),
+    });
+    Expr::Block(stmts, None)
+}
+
+fn make_trmc_build_function(
+    func: &IrFunction,
+    candidate: &TrmcCandidate,
+    build_name: &str,
+    frame_nil_tag: &str,
+    frame_cons_tag: &str,
+    frames_param: &str,
+    acc_param: &str,
+) -> IrFunction {
+    let rest_name = "__trmc_rest".to_string();
+    let token_name = "__trmc_token".to_string();
+    let field_names: Vec<String> = (0..candidate.non_recursive_fields.len())
+        .map(|idx| format!("__trmc_field_{}", idx))
+        .collect();
+
+    let mut cons_patterns = Vec::with_capacity(field_names.len() + 2);
+    cons_patterns.extend(field_names.iter().cloned().map(Pattern::Var));
+    cons_patterns.push(Pattern::Var(token_name.clone()));
+    cons_patterns.push(Pattern::Var(rest_name.clone()));
+
+    let mut rebuilt_fields: Vec<Expr> = field_names
+        .iter()
+        .cloned()
+        .map(|name| Expr::Var(name, None))
+        .collect();
+    rebuilt_fields.push(Expr::Var(acc_param.to_string(), func.ty.clone()));
+
+    let rebuilt_alloc = Expr::MakeEnum {
+        tag: candidate.constructor_tag.clone(),
+        payload: Box::new(make_payload_expr(rebuilt_fields)),
+        ty: None,
+    };
+
+    let reuse_acc = Expr::Reuse {
+        token: token_name,
+        alloc: Box::new(rebuilt_alloc),
+    };
+
+    let body = Expr::Match {
+        subject: Box::new(Expr::Var(frames_param.to_string(), None)),
+        arms: vec![
+            MatchArm {
+                pattern: Pattern::Constructor(frame_nil_tag.to_string(), vec![]),
+                guard: None,
+                body: Expr::Var(acc_param.to_string(), func.ty.clone()),
+            },
+            MatchArm {
+                pattern: Pattern::Constructor(frame_cons_tag.to_string(), cons_patterns),
+                guard: None,
+                body: Expr::TailCall {
+                    name: build_name.to_string(),
+                    args: vec![Expr::Var(rest_name, None), reuse_acc],
+                    ty: func.ty.clone(),
+                },
+            },
+        ],
+        ty: func.ty.clone(),
+    };
+
+    IrFunction {
+        name: build_name.to_string(),
+        params: vec![frames_param.to_string(), acc_param.to_string()],
+        body,
+        ty: func.ty.clone(),
+        param_types: vec![None, func.ty.clone()],
+        span: func.span.clone(),
+    }
+}
+
+fn make_payload_expr(mut fields: Vec<Expr>) -> Expr {
+    match fields.len() {
+        0 => Expr::Unit,
+        1 => fields.pop().unwrap(),
+        _ => Expr::MakeTuple(fields, None),
+    }
+}
+
+fn param_vars(func: &IrFunction) -> Vec<Expr> {
+    func.params
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let ty = func.param_types.get(idx).cloned().unwrap_or(None);
+            Expr::Var(name.clone(), ty)
+        })
+        .collect()
+}
+
+fn detect_trmc_candidate(func: &IrFunction) -> Option<TrmcCandidate> {
+    let Expr::Match { subject, arms, .. } = &func.body else {
+        return None;
+    };
+    let Expr::Var(subject_name, _) = subject.as_ref() else {
+        return None;
+    };
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    count_var_uses(&func.body, &mut counts);
+    if counts.get(subject_name).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+
+    let mut recursive_arm_index = None;
+    let mut recursive_arm = None;
+
+    for (idx, arm) in arms.iter().enumerate() {
+        if !references_function(&arm.body, &func.name) {
+            continue;
+        }
+
+        let Pattern::Constructor(pattern_tag, pattern_fields) = &arm.pattern else {
+            return None;
+        };
+        let info = analyze_trmc_recursive_arm(&arm.body, &func.name)?;
+        if info.constructor_tag != *pattern_tag {
+            return None;
+        }
+        if pattern_fields.len() != info.non_recursive_fields.len() + 1 {
+            return None;
+        }
+
+        if recursive_arm_index.is_some() {
+            // Strict first pass: only one recursive constructor arm.
+            return None;
+        }
+        recursive_arm_index = Some(idx);
+        recursive_arm = Some(info);
+    }
+
+    let recursive_arm_index = recursive_arm_index?;
+    let recursive_arm = recursive_arm?;
+
+    for (idx, arm) in arms.iter().enumerate() {
+        if idx != recursive_arm_index && references_function(&arm.body, &func.name) {
+            return None;
+        }
+    }
+
+    Some(TrmcCandidate {
+        subject_name: subject_name.clone(),
+        recursive_arm_index,
+        constructor_tag: recursive_arm.constructor_tag,
+        non_recursive_fields: recursive_arm.non_recursive_fields,
+        recursive_args: recursive_arm.recursive_args,
+        recursive_prefix: recursive_arm.prefix_exprs,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct TrmcRecursiveArmInfo {
+    constructor_tag: String,
+    non_recursive_fields: Vec<Expr>,
+    recursive_args: Vec<Expr>,
+    prefix_exprs: Vec<Expr>,
+}
+
+fn analyze_trmc_recursive_arm(body: &Expr, func_name: &str) -> Option<TrmcRecursiveArmInfo> {
+    let (prefix_exprs, terminal) = split_terminal_expr(body.clone());
+    if prefix_exprs
+        .iter()
+        .any(|expr| references_function(expr, func_name))
+    {
+        return None;
+    }
+
+    let Expr::MakeEnum { tag, payload, .. } = terminal else {
+        return None;
+    };
+    let fields = enum_payload_fields(*payload);
+    if fields.is_empty() {
+        return None;
+    }
+
+    let recursive_field = fields.last().cloned().unwrap();
+    let non_recursive_fields = fields[..fields.len() - 1].to_vec();
+    if non_recursive_fields
+        .iter()
+        .any(|expr| references_function(expr, func_name))
+    {
+        return None;
+    }
+
+    let recursive_args = match recursive_field {
+        Expr::CallDirect { name, args, .. } if name == func_name => args,
+        Expr::TailCall { name, args, .. } if name == func_name => args,
+        _ => return None,
+    };
+    if recursive_args
+        .iter()
+        .any(|expr| references_function(expr, func_name))
+    {
+        return None;
+    }
+
+    Some(TrmcRecursiveArmInfo {
+        constructor_tag: tag,
+        non_recursive_fields,
+        recursive_args,
+        prefix_exprs,
+    })
+}
+
+fn split_terminal_expr(body: Expr) -> (Vec<Expr>, Expr) {
+    match body {
+        Expr::Block(mut exprs, _) if !exprs.is_empty() => {
+            let terminal = exprs.pop().unwrap();
+            (exprs, terminal)
+        }
+        other => (Vec::new(), other),
+    }
+}
+
+fn enum_payload_fields(payload: Expr) -> Vec<Expr> {
+    match payload {
+        Expr::MakeTuple(items, _) => items,
+        Expr::Unit => Vec::new(),
+        other => vec![other],
+    }
+}
+
 /// Recursively walk an expression, inserting Drop/Reuse where appropriate.
 fn insert_reuse_in_expr(expr: Expr, counts: &HashMap<String, usize>, counter: &mut usize) -> Expr {
     match expr {
@@ -1087,7 +1562,7 @@ fn insert_reuse_in_expr(expr: Expr, counts: &HashMap<String, usize>, counter: &m
                             return arm;
                         }
                         if let Some(rewritten) =
-                            try_wrap_with_reuse(&arm.body, name, counter)
+                            try_wrap_with_reuse(&arm.body, &arm.pattern, name, counter)
                         {
                             MatchArm {
                                 body: rewritten,
@@ -1111,35 +1586,185 @@ fn insert_reuse_in_expr(expr: Expr, counts: &HashMap<String, usize>, counter: &m
 /// Check if a match arm exhibits the CoW single-field-update pattern
 /// (same enum tag with only one field changed). Skip reuse for these.
 fn is_cow_arm(arm: &MatchArm) -> bool {
-    // CoW pattern: Constructor(tag, fields) -> MakeEnum { same_tag, ... }
-    // with all fields except one identical to bindings from the pattern.
-    // For simplicity, detect the narrow case: pattern is a Constructor
-    // and the body is a MakeEnum with the same tag.
-    if let Pattern::Constructor(pat_tag, _) = &arm.pattern {
-        if let Expr::MakeEnum { tag, .. } = find_outermost_constructor(&arm.body) {
-            return tag == pat_tag;
-        }
+    let Pattern::Constructor(tag, payload_patterns) = &arm.pattern else {
+        return false;
+    };
+    if payload_patterns.is_empty() {
+        return false;
     }
-    false
+    let bindings: Vec<String> = payload_patterns
+        .iter()
+        .map(|p| match p {
+            Pattern::Var(name) => name.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    is_single_field_enum_update_expr(&arm.body, tag, &bindings)
 }
 
-/// Find the outermost constructor in an expression (skipping through Blocks/Lets/Ifs).
-fn find_outermost_constructor(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Block(exprs, _) if !exprs.is_empty() => {
-            find_outermost_constructor(exprs.last().unwrap())
+fn detect_single_field_update(fields: &[Expr], bindings: &[String]) -> bool {
+    if fields.len() != bindings.len() {
+        return false;
+    }
+    let mut changed = 0usize;
+    for (field, binding) in fields.iter().zip(bindings.iter()) {
+        if matches!(field, Expr::Var(name, _) if name == binding) {
+            continue;
         }
-        Expr::If { then_branch, .. } => find_outermost_constructor(then_branch),
-        Expr::Let { .. } => expr, // Let bindings — don't look deeper
-        other => other,
+        changed += 1;
+        if changed > 1 {
+            return false;
+        }
+    }
+    changed == 1
+}
+
+fn is_single_field_enum_update_expr(expr: &Expr, tag: &str, bindings: &[String]) -> bool {
+    match expr {
+        Expr::MakeEnum {
+            tag: body_tag,
+            payload,
+            ..
+        } if body_tag == tag => {
+            if let Expr::MakeTuple(fields, _) = payload.as_ref() {
+                detect_single_field_update(fields, bindings)
+            } else {
+                false
+            }
+        }
+        Expr::Block(exprs, _) if !exprs.is_empty() => {
+            is_single_field_enum_update_expr(exprs.last().unwrap(), tag, bindings)
+        }
+        Expr::If {
+            then_branch,
+            else_branch: Some(else_branch),
+            ..
+        } => {
+            is_single_field_enum_update_expr(then_branch, tag, bindings)
+                && is_single_field_enum_update_expr(else_branch, tag, bindings)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReuseShape {
+    Enum { tag: String, arity: usize },
+    Tuple { len: usize },
+    Record { fields: Vec<String> },
+    Struct { name: String, fields: Vec<String> },
+}
+
+fn sorted_expr_field_names(fields: &[(String, Expr)]) -> Vec<String> {
+    let mut names: Vec<String> = fields.iter().map(|(name, _)| name.clone()).collect();
+    names.sort();
+    names
+}
+
+fn sorted_pattern_field_names(fields: &[(String, Pattern)]) -> Vec<String> {
+    let mut names: Vec<String> = fields.iter().map(|(name, _)| name.clone()).collect();
+    names.sort();
+    names
+}
+
+fn enum_payload_arity(payload: &Expr) -> usize {
+    match payload {
+        Expr::Unit => 0,
+        Expr::MakeTuple(items, _) => items.len(),
+        _ => 1,
+    }
+}
+
+fn pattern_reuse_shape(pattern: &Pattern) -> Option<ReuseShape> {
+    match pattern {
+        // Nullary constructors are compile-time constants in the JIT and are not
+        // safe to target for in-place mutation through jit_drop_reuse.
+        Pattern::Constructor(_, fields) if fields.is_empty() => None,
+        Pattern::Constructor(tag, fields) => Some(ReuseShape::Enum {
+            tag: tag.clone(),
+            arity: fields.len(),
+        }),
+        Pattern::Tuple(fields) => Some(ReuseShape::Tuple { len: fields.len() }),
+        Pattern::Record(fields) => Some(ReuseShape::Record {
+            fields: sorted_pattern_field_names(fields),
+        }),
+        Pattern::Wildcard | Pattern::Var(_) | Pattern::Literal(_) | Pattern::List(_, _) => None,
+    }
+}
+
+/// Determine the constructor shape produced by an expression's result position.
+///
+/// For conditionals, both branches must produce the same shape to be eligible.
+fn expr_reuse_shape(expr: &Expr) -> Option<ReuseShape> {
+    match expr {
+        Expr::MakeEnum { tag, payload, .. } => Some(ReuseShape::Enum {
+            tag: tag.clone(),
+            arity: enum_payload_arity(payload),
+        }),
+        Expr::MakeStruct { name, fields, .. } => Some(ReuseShape::Struct {
+            name: name.clone(),
+            fields: sorted_expr_field_names(fields),
+        }),
+        Expr::MakeRecord(fields, _) => Some(ReuseShape::Record {
+            fields: sorted_expr_field_names(fields),
+        }),
+        Expr::MakeTuple(items, _) => Some(ReuseShape::Tuple { len: items.len() }),
+        Expr::Block(exprs, _) if !exprs.is_empty() => expr_reuse_shape(exprs.last().unwrap()),
+        Expr::If {
+            then_branch,
+            else_branch: Some(else_branch),
+            ..
+        } => {
+            let then_shape = expr_reuse_shape(then_branch)?;
+            let else_shape = expr_reuse_shape(else_branch)?;
+            if then_shape == else_shape {
+                Some(then_shape)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Reuse is only valid when the destructured pattern shape matches the
+/// reconstructed allocation shape in that arm.
+fn is_reuse_shape_compatible(pattern: &Pattern, body: &Expr) -> bool {
+    let Some(pattern_shape) = pattern_reuse_shape(pattern) else {
+        return false;
+    };
+    let Some(body_shape) = expr_reuse_shape(body) else {
+        return false;
+    };
+
+    match (pattern_shape, body_shape) {
+        (
+            ReuseShape::Enum {
+                tag: pattern_tag,
+                arity: pattern_arity,
+            },
+            ReuseShape::Enum {
+                tag: body_tag,
+                arity: body_arity,
+            },
+        ) => pattern_tag == body_tag && pattern_arity == body_arity,
+        (ReuseShape::Tuple { len: p }, ReuseShape::Tuple { len: b }) => p == b,
+        (ReuseShape::Record { fields: p }, ReuseShape::Record { fields: b }) => p == b,
+        // Record patterns can match named structs by field shape.
+        (ReuseShape::Record { fields: p }, ReuseShape::Struct { fields: b, .. }) => p == b,
+        _ => false,
     }
 }
 
 /// Try to find a constructor in the arm body and wrap it with Drop/Reuse.
 /// Returns Some(wrapped_expr) if successful.
-fn try_wrap_with_reuse(body: &Expr, drop_name: &str, counter: &mut usize) -> Option<Expr> {
-    // Find the outermost constructor allocation in the body
-    if !contains_constructor(body) {
+fn try_wrap_with_reuse(
+    body: &Expr,
+    pattern: &Pattern,
+    drop_name: &str,
+    counter: &mut usize,
+) -> Option<Expr> {
+    if !is_reuse_shape_compatible(pattern, body) {
         return None;
     }
 
@@ -1153,27 +1778,6 @@ fn try_wrap_with_reuse(body: &Expr, drop_name: &str, counter: &mut usize) -> Opt
         token: Some(token),
         body: Box::new(rewritten_body),
     })
-}
-
-/// Check if an expression contains a constructor at its "result" position.
-/// Recurses through Block, If/else, and Let to find tail constructors.
-fn contains_constructor(expr: &Expr) -> bool {
-    match expr {
-        Expr::MakeEnum { .. }
-        | Expr::MakeStruct { .. }
-        | Expr::MakeRecord(_, _)
-        | Expr::MakeTuple(_, _) => true,
-        Expr::Block(exprs, _) if !exprs.is_empty() => contains_constructor(exprs.last().unwrap()),
-        Expr::If {
-            then_branch,
-            else_branch: Some(else_branch),
-            ..
-        } => {
-            // Both branches must have constructors for reuse to be worthwhile
-            contains_constructor(then_branch) && contains_constructor(else_branch)
-        }
-        _ => false,
-    }
 }
 
 /// Wrap the outermost constructor in an expression with Reuse.
@@ -1330,7 +1934,11 @@ fn walk_expr_children(expr: Expr, mut f: impl FnMut(Expr) -> Expr) -> Expr {
             name,
             value: Box::new(f(*value)),
         },
-        Expr::FieldAssign { object, field, value } => Expr::FieldAssign {
+        Expr::FieldAssign {
+            object,
+            field,
+            value,
+        } => Expr::FieldAssign {
             object,
             field,
             value: Box::new(f(*value)),
@@ -1544,7 +2152,9 @@ fn visit_immediate_children(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             f(iterable);
             f(body);
         }
-        Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => f(value),
+        Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => {
+            f(value)
+        }
         Expr::Block(exprs, _) => {
             for e in exprs {
                 f(e);
@@ -1683,7 +2293,9 @@ fn visit_expr_children(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         }
 
         // Bindings
-        Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => visit_expr(value, f),
+        Expr::Let { value, .. } | Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => {
+            visit_expr(value, f)
+        }
         Expr::Block(exprs, _) => {
             for e in exprs {
                 visit_expr(e, f);
@@ -1943,7 +2555,11 @@ fn propagate_expr(expr: Expr, env: &mut Vec<HashMap<String, Expr>>) -> Expr {
             }
         }
 
-        Expr::FieldAssign { object, field, value } => {
+        Expr::FieldAssign {
+            object,
+            field,
+            value,
+        } => {
             let value = propagate_expr(*value, env);
             // Invalidate propagated constant for the object variable
             for scope in env.iter_mut().rev() {
@@ -2461,19 +3077,17 @@ fn eliminate_dead_lets(expr: Expr) -> Expr {
 /// Count variable references in an expression tree.
 /// Also counts Assign targets — a variable that is reassigned must not be eliminated.
 fn count_var_uses(expr: &Expr, counts: &mut HashMap<String, usize>) {
-    visit_expr(expr, &mut |e| {
-        match e {
-            Expr::Var(name, _) => {
-                *counts.entry(name.clone()).or_insert(0) += 1;
-            }
-            Expr::Assign { name, .. } => {
-                *counts.entry(name.clone()).or_insert(0) += 1;
-            }
-            Expr::FieldAssign { object, .. } => {
-                *counts.entry(object.clone()).or_insert(0) += 1;
-            }
-            _ => {}
+    visit_expr(expr, &mut |e| match e {
+        Expr::Var(name, _) => {
+            *counts.entry(name.clone()).or_insert(0) += 1;
         }
+        Expr::Assign { name, .. } => {
+            *counts.entry(name.clone()).or_insert(0) += 1;
+        }
+        Expr::FieldAssign { object, .. } => {
+            *counts.entry(object.clone()).or_insert(0) += 1;
+        }
+        _ => {}
     });
 }
 
@@ -2518,6 +3132,21 @@ mod tests {
             functions: vec![IrFunction {
                 name: "main".into(),
                 params: vec![],
+                body,
+                ty: None,
+                param_types: vec![],
+                span: dummy_span(),
+            }],
+            entry: 0,
+            tags: TagRegistry::new(),
+        }
+    }
+
+    fn make_module_with_params(params: &[&str], body: Expr) -> IrModule {
+        IrModule {
+            functions: vec![IrFunction {
+                name: "main".into(),
+                params: params.iter().map(|p| (*p).to_string()).collect(),
                 body,
                 ty: None,
                 param_types: vec![],
@@ -3123,6 +3752,466 @@ mod tests {
         assert!(module.tags.get_id("None").is_some());
         assert!(module.tags.get_id("Some").is_some());
         assert!(module.tags.get_id("MyTag").is_some());
+    }
+
+    #[test]
+    fn drop_reuse_skips_mismatched_enum_tag() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("x".into(), None)),
+            arms: vec![MatchArm {
+                pattern: Pattern::Constructor("Some".into(), vec![Pattern::Var("v".into())]),
+                guard: None,
+                body: Expr::MakeEnum {
+                    tag: "Other".into(),
+                    payload: Box::new(Expr::Var("v".into(), None)),
+                    ty: None,
+                },
+            }],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["x"], body);
+        optimize(&mut module);
+
+        let Expr::Match { arms, .. } = &module.functions[0].body else {
+            panic!("Expected Match, got: {:?}", module.functions[0].body);
+        };
+        assert!(
+            matches!(arms[0].body, Expr::MakeEnum { .. }),
+            "Expected arm body to remain MakeEnum (no Drop/Reuse), got: {:?}",
+            arms[0].body
+        );
+    }
+
+    #[test]
+    fn drop_reuse_skips_mismatched_enum_arity() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("x".into(), None)),
+            arms: vec![MatchArm {
+                pattern: Pattern::Constructor("Some".into(), vec![Pattern::Var("v".into())]),
+                guard: None,
+                body: Expr::MakeEnum {
+                    tag: "Some".into(),
+                    payload: Box::new(Expr::MakeTuple(
+                        vec![Expr::Var("v".into(), None), Expr::Int(1)],
+                        None,
+                    )),
+                    ty: None,
+                },
+            }],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["x"], body);
+        optimize(&mut module);
+
+        let Expr::Match { arms, .. } = &module.functions[0].body else {
+            panic!("Expected Match, got: {:?}", module.functions[0].body);
+        };
+        assert!(
+            matches!(arms[0].body, Expr::MakeEnum { .. }),
+            "Expected arity-mismatched arm to skip Drop/Reuse, got: {:?}",
+            arms[0].body
+        );
+    }
+
+    #[test]
+    fn drop_reuse_inserts_for_matching_tuple_shape() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("t".into(), None)),
+            arms: vec![MatchArm {
+                pattern: Pattern::Tuple(vec![Pattern::Var("a".into()), Pattern::Var("b".into())]),
+                guard: None,
+                body: Expr::MakeTuple(
+                    vec![Expr::Var("a".into(), None), Expr::Var("b".into(), None)],
+                    None,
+                ),
+            }],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["t"], body);
+        optimize(&mut module);
+
+        let Expr::Match { arms, .. } = &module.functions[0].body else {
+            panic!("Expected Match, got: {:?}", module.functions[0].body);
+        };
+        let Expr::Drop {
+            token: Some(_),
+            body,
+            ..
+        } = &arms[0].body
+        else {
+            panic!(
+                "Expected matching tuple arm to get Drop/Reuse, got: {:?}",
+                arms[0].body
+            );
+        };
+        assert!(
+            matches!(body.as_ref(), Expr::Reuse { alloc, .. } if matches!(alloc.as_ref(), Expr::MakeTuple(items, _) if items.len() == 2)),
+            "Expected Drop body to contain Reuse(MakeTuple(len=2)), got: {:?}",
+            body
+        );
+    }
+
+    #[test]
+    fn drop_reuse_skips_if_branch_shape_mismatch() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("t".into(), None)),
+            arms: vec![MatchArm {
+                pattern: Pattern::Tuple(vec![Pattern::Var("a".into()), Pattern::Var("b".into())]),
+                guard: None,
+                body: Expr::If {
+                    condition: Box::new(Expr::Var("cond".into(), None)),
+                    then_branch: Box::new(Expr::MakeTuple(
+                        vec![Expr::Var("a".into(), None), Expr::Var("b".into(), None)],
+                        None,
+                    )),
+                    else_branch: Some(Box::new(Expr::MakeTuple(
+                        vec![
+                            Expr::Var("a".into(), None),
+                            Expr::Var("b".into(), None),
+                            Expr::Int(0),
+                        ],
+                        None,
+                    ))),
+                    ty: None,
+                },
+            }],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["t", "cond"], body);
+        optimize(&mut module);
+
+        let Expr::Match { arms, .. } = &module.functions[0].body else {
+            panic!("Expected Match, got: {:?}", module.functions[0].body);
+        };
+        assert!(
+            !matches!(arms[0].body, Expr::Drop { .. }),
+            "Expected branch-shape mismatch to skip Drop/Reuse, got: {:?}",
+            arms[0].body
+        );
+    }
+
+    #[test]
+    fn drop_reuse_skips_single_field_enum_cow_arm() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("node".into(), None)),
+            arms: vec![MatchArm {
+                pattern: Pattern::Constructor(
+                    "Node".into(),
+                    vec![
+                        Pattern::Var("a".into()),
+                        Pattern::Var("b".into()),
+                        Pattern::Var("c".into()),
+                    ],
+                ),
+                guard: None,
+                body: Expr::MakeEnum {
+                    tag: "Node".into(),
+                    payload: Box::new(Expr::MakeTuple(
+                        vec![
+                            Expr::Var("a".into(), None),
+                            Expr::Int(1),
+                            Expr::Var("c".into(), None),
+                        ],
+                        None,
+                    )),
+                    ty: None,
+                },
+            }],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["node"], body);
+        optimize(&mut module);
+
+        let Expr::Match { arms, .. } = &module.functions[0].body else {
+            panic!("Expected Match, got: {:?}", module.functions[0].body);
+        };
+        assert!(
+            !matches!(arms[0].body, Expr::Drop { .. }),
+            "Expected single-field CoW arm to skip Drop/Reuse, got: {:?}",
+            arms[0].body
+        );
+    }
+
+    #[test]
+    fn drop_reuse_inserts_for_multi_field_enum_update() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("node".into(), None)),
+            arms: vec![MatchArm {
+                pattern: Pattern::Constructor(
+                    "Node".into(),
+                    vec![
+                        Pattern::Var("a".into()),
+                        Pattern::Var("b".into()),
+                        Pattern::Var("c".into()),
+                    ],
+                ),
+                guard: None,
+                body: Expr::MakeEnum {
+                    tag: "Node".into(),
+                    payload: Box::new(Expr::MakeTuple(
+                        vec![Expr::Int(0), Expr::Int(1), Expr::Var("c".into(), None)],
+                        None,
+                    )),
+                    ty: None,
+                },
+            }],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["node"], body);
+        optimize(&mut module);
+
+        let Expr::Match { arms, .. } = &module.functions[0].body else {
+            panic!("Expected Match, got: {:?}", module.functions[0].body);
+        };
+        assert!(
+            matches!(arms[0].body, Expr::Drop { .. }),
+            "Expected multi-field enum update to use Drop/Reuse, got: {:?}",
+            arms[0].body
+        );
+    }
+
+    #[test]
+    fn drop_reuse_inserts_for_mixed_if_enum_update() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("node".into(), None)),
+            arms: vec![MatchArm {
+                pattern: Pattern::Constructor(
+                    "Node".into(),
+                    vec![
+                        Pattern::Var("a".into()),
+                        Pattern::Var("b".into()),
+                        Pattern::Var("c".into()),
+                    ],
+                ),
+                guard: None,
+                body: Expr::If {
+                    condition: Box::new(Expr::Var("cond".into(), None)),
+                    then_branch: Box::new(Expr::MakeEnum {
+                        tag: "Node".into(),
+                        payload: Box::new(Expr::MakeTuple(
+                            vec![
+                                Expr::Var("a".into(), None),
+                                Expr::Int(1),
+                                Expr::Var("c".into(), None),
+                            ],
+                            None,
+                        )),
+                        ty: None,
+                    }),
+                    else_branch: Some(Box::new(Expr::MakeEnum {
+                        tag: "Node".into(),
+                        payload: Box::new(Expr::MakeTuple(
+                            vec![Expr::Int(0), Expr::Int(1), Expr::Var("c".into(), None)],
+                            None,
+                        )),
+                        ty: None,
+                    })),
+                    ty: None,
+                },
+            }],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["node", "cond"], body);
+        optimize(&mut module);
+
+        let Expr::Match { arms, .. } = &module.functions[0].body else {
+            panic!("Expected Match, got: {:?}", module.functions[0].body);
+        };
+        assert!(
+            matches!(arms[0].body, Expr::Drop { .. }),
+            "Expected mixed if-branch enum update to keep Drop/Reuse path, got: {:?}",
+            arms[0].body
+        );
+    }
+
+    #[test]
+    fn trmc_rewrites_single_recursive_constructor_arm() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("xs".into(), None)),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Constructor(
+                        "Cons".into(),
+                        vec![Pattern::Var("h".into()), Pattern::Var("t".into())],
+                    ),
+                    guard: None,
+                    body: Expr::MakeEnum {
+                        tag: "Cons".into(),
+                        payload: Box::new(Expr::MakeTuple(
+                            vec![
+                                Expr::Var("h".into(), None),
+                                Expr::CallDirect {
+                                    name: "main".into(),
+                                    args: vec![Expr::Var("t".into(), None)],
+                                    ty: None,
+                                },
+                            ],
+                            None,
+                        )),
+                        ty: None,
+                    },
+                },
+                MatchArm {
+                    pattern: Pattern::Constructor("Nil".into(), vec![]),
+                    guard: None,
+                    body: Expr::MakeEnum {
+                        tag: "Nil".into(),
+                        payload: Box::new(Expr::Unit),
+                        ty: None,
+                    },
+                },
+            ],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["xs"], body);
+        optimize(&mut module);
+
+        assert!(
+            module.functions.iter().any(|f| f.name == "main__trmc_loop"),
+            "Expected generated loop helper, functions: {:?}",
+            module
+                .functions
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            module
+                .functions
+                .iter()
+                .any(|f| f.name == "main__trmc_build"),
+            "Expected generated build helper"
+        );
+        assert!(
+            matches!(&module.functions[0].body, Expr::CallDirect { name, .. } if name == "main__trmc_loop"),
+            "Expected wrapper body to call main__trmc_loop, got: {:?}",
+            module.functions[0].body
+        );
+
+        let loop_fn = module
+            .functions
+            .iter()
+            .find(|f| f.name == "main__trmc_loop")
+            .unwrap();
+        let Expr::Match { arms, .. } = &loop_fn.body else {
+            panic!(
+                "Expected TRMC loop body to be a match, got: {:?}",
+                loop_fn.body
+            );
+        };
+        let cons_arm = arms
+            .iter()
+            .find(|arm| matches!(&arm.pattern, Pattern::Constructor(tag, _) if tag == "Cons"))
+            .unwrap();
+        let mut has_drop_tail_loop = false;
+        super::visit_expr(&cons_arm.body, &mut |e| {
+            if let Expr::Drop { body, .. } = e
+                && matches!(body.as_ref(), Expr::TailCall { name, .. } if name == "main__trmc_loop")
+            {
+                has_drop_tail_loop = true;
+            }
+        });
+        assert!(
+            has_drop_tail_loop,
+            "Expected recursive loop arm to contain Drop -> TailCall(main__trmc_loop), got: {:?}",
+            cons_arm.body
+        );
+
+        let build_fn = module
+            .functions
+            .iter()
+            .find(|f| f.name == "main__trmc_build")
+            .unwrap();
+        let Expr::Match {
+            arms: build_arms, ..
+        } = &build_fn.body
+        else {
+            panic!(
+                "Expected TRMC build body to be a match, got: {:?}",
+                build_fn.body
+            );
+        };
+        let frame_arm = build_arms
+            .iter()
+            .find(|arm| matches!(&arm.pattern, Pattern::Constructor(tag, _) if tag.starts_with("__trmc_cons_")))
+            .unwrap();
+        let mut has_build_tail = false;
+        let mut has_cons_reuse = false;
+        super::visit_expr(&frame_arm.body, &mut |e| {
+            if matches!(e, Expr::TailCall { name, .. } if name == "main__trmc_build") {
+                has_build_tail = true;
+            }
+            if matches!(e, Expr::Reuse { alloc, .. } if matches!(alloc.as_ref(), Expr::MakeEnum { tag, .. } if tag == "Cons"))
+            {
+                has_cons_reuse = true;
+            }
+        });
+        assert!(has_build_tail, "Expected build helper to self-tail-call");
+        assert!(
+            has_cons_reuse,
+            "Expected build helper to reconstruct Cons via Reuse"
+        );
+    }
+
+    #[test]
+    fn trmc_skips_when_recursive_call_not_last_field() {
+        let body = Expr::Match {
+            subject: Box::new(Expr::Var("xs".into(), None)),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Constructor(
+                        "Cons".into(),
+                        vec![Pattern::Var("h".into()), Pattern::Var("t".into())],
+                    ),
+                    guard: None,
+                    body: Expr::MakeEnum {
+                        tag: "Cons".into(),
+                        payload: Box::new(Expr::MakeTuple(
+                            vec![
+                                Expr::CallDirect {
+                                    name: "main".into(),
+                                    args: vec![Expr::Var("t".into(), None)],
+                                    ty: None,
+                                },
+                                Expr::Var("h".into(), None),
+                            ],
+                            None,
+                        )),
+                        ty: None,
+                    },
+                },
+                MatchArm {
+                    pattern: Pattern::Constructor("Nil".into(), vec![]),
+                    guard: None,
+                    body: Expr::MakeEnum {
+                        tag: "Nil".into(),
+                        payload: Box::new(Expr::Unit),
+                        ty: None,
+                    },
+                },
+            ],
+            ty: None,
+        };
+
+        let mut module = make_module_with_params(&["xs"], body);
+        optimize(&mut module);
+
+        assert!(
+            !module.functions.iter().any(|f| f.name == "main__trmc_loop"),
+            "TRMC should skip non-tail-modulo-constructor shape"
+        );
+        assert!(
+            matches!(&module.functions[0].body, Expr::Match { .. }),
+            "Original function should stay unchanged when TRMC is ineligible"
+        );
     }
 
     // -- Lambda lifting tests --

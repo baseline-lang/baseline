@@ -1,4 +1,4 @@
-use super::analysis::can_jit;
+use super::analysis::{can_jit, compute_unboxed_flags};
 use super::compile::FnCompileCtx;
 use super::*;
 use crate::analysis::types::Type;
@@ -202,7 +202,7 @@ fn jit_function_call() {
                 },
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
             IrFunction {
                 name: "double".into(),
@@ -210,7 +210,7 @@ fn jit_function_call() {
                 body: make_binop(BinOp::Add, make_var("n"), make_var("n")),
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
         ],
         entry: 0,
@@ -248,7 +248,7 @@ fn jit_recursive_fib10() {
                 body: fib_body,
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
             IrFunction {
                 name: "main".into(),
@@ -260,7 +260,7 @@ fn jit_recursive_fib10() {
                 },
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
         ],
         entry: 1,
@@ -290,7 +290,7 @@ fn jit_unboxed_bool_recursive_helper_from_main() {
                 body: helper_body,
                 ty: Some(Type::Bool),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
             IrFunction {
                 name: "main".into(),
@@ -302,13 +302,56 @@ fn jit_unboxed_bool_recursive_helper_from_main() {
                 },
                 ty: Some(Type::Bool),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
         ],
         entry: 1,
         tags: TagRegistry::new(),
     };
+    let unboxed = compute_unboxed_flags(&module);
+    assert!(unboxed[0], "helper should be unboxed");
+    assert!(!unboxed[1], "entry must stay boxed");
     assert!(compile_and_run_bool(&module));
+}
+
+#[test]
+fn jit_unboxed_bool_param_boundary_from_main() {
+    let module = IrModule {
+        functions: vec![
+            IrFunction {
+                name: "check_flag".into(),
+                params: vec!["flag".into()],
+                body: Expr::If {
+                    condition: Box::new(Expr::Var("flag".into(), Some(Type::Bool))),
+                    then_branch: Box::new(make_int(1)),
+                    else_branch: Some(Box::new(make_int(2))),
+                    ty: Some(Type::Int),
+                },
+                ty: Some(Type::Int),
+                param_types: vec![Some(Type::Bool)],
+                span: dummy_span(),
+            },
+            IrFunction {
+                name: "main".into(),
+                params: vec![],
+                body: Expr::CallDirect {
+                    name: "check_flag".into(),
+                    args: vec![Expr::Bool(false)],
+                    ty: Some(Type::Int),
+                },
+                ty: Some(Type::Int),
+                param_types: vec![],
+                span: dummy_span(),
+            },
+        ],
+        entry: 1,
+        tags: TagRegistry::new(),
+    };
+
+    let unboxed = compute_unboxed_flags(&module);
+    assert!(unboxed[0], "check_flag should be unboxed");
+    assert!(!unboxed[1], "entry must stay boxed");
+    assert_eq!(compile_and_run(&module), 2);
 }
 
 #[test]
@@ -332,7 +375,7 @@ fn jit_unboxed_float_recursive_helper_from_main() {
                 body: helper_body,
                 ty: Some(Type::Float),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
             IrFunction {
                 name: "main".into(),
@@ -344,7 +387,7 @@ fn jit_unboxed_float_recursive_helper_from_main() {
                 },
                 ty: Some(Type::Float),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
         ],
         entry: 1,
@@ -445,7 +488,7 @@ fn jit_tail_call_as_regular_call() {
                 },
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
             IrFunction {
                 name: "main".into(),
@@ -457,7 +500,7 @@ fn jit_tail_call_as_regular_call() {
                 },
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
         ],
         entry: 1,

@@ -140,6 +140,12 @@ fn aot_list_ops() {
 }
 
 #[test]
+fn aot_list_cow_ops() {
+    let output = compile_and_run("tests/aot/list_cow_ops.bl");
+    assert_eq!(output, "11");
+}
+
+#[test]
 fn aot_option_unwrap() {
     let output = compile_and_run("tests/aot/option_unwrap.bl");
     assert_eq!(output, "54");
@@ -201,6 +207,12 @@ fn aot_fs_ops() {
 fn aot_map_ops() {
     let output = compile_and_run("tests/aot/map_ops.bl");
     assert_eq!(output, "8");
+}
+
+#[test]
+fn aot_map_cow_ops() {
+    let output = compile_and_run("tests/aot/map_cow_ops.bl");
+    assert_eq!(output, "10");
 }
 
 #[test]

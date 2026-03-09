@@ -5,12 +5,18 @@
 //! records, enums, closures) and indirect call dispatch.
 
 use std::cell::{Cell, RefCell};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fiber::{self, Fiber, FiberState};
+#[cfg(debug_assertions)]
+use crate::nvalue::ALLOC_STATS;
 use crate::nvalue::{
-    ALLOC_STATS, HeapObject, NValue, PAYLOAD_MASK, TAG_BOOL, TAG_HEAP, TAG_INT, TAG_MASK, TAG_UNIT,
+    HeapObject, NValue, PAYLOAD_MASK, TAG_BOOL, TAG_HEAP, TAG_INT, TAG_MASK, TAG_UNIT,
 };
-use crate::rc::{self, Rc};
+use crate::rc;
+#[cfg(debug_assertions)]
+use crate::rc::Rc;
 use crate::value::RcStr;
 
 // ---------------------------------------------------------------------------
@@ -41,6 +47,56 @@ thread_local! {
 // mem::forget instead of pushing to the arena. RC codegen handles cleanup.
 thread_local! {
     static JIT_RC_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
+static JIT_HELPER_CALLS: AtomicU64 = AtomicU64::new(0);
+static JIT_BOX_BOUNDARY_CALLS: AtomicU64 = AtomicU64::new(0);
+static JIT_UNBOX_BOUNDARY_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy)]
+pub struct JitCounterSnapshot {
+    pub helper_calls: u64,
+    pub box_boundary_calls: u64,
+    pub unbox_boundary_calls: u64,
+}
+
+impl fmt::Display for JitCounterSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "helper_calls: {}  box_boundary_calls: {}  unbox_boundary_calls: {}",
+            self.helper_calls, self.box_boundary_calls, self.unbox_boundary_calls
+        )
+    }
+}
+
+pub fn jit_counter_snapshot() -> JitCounterSnapshot {
+    JitCounterSnapshot {
+        helper_calls: JIT_HELPER_CALLS.load(Ordering::Relaxed),
+        box_boundary_calls: JIT_BOX_BOUNDARY_CALLS.load(Ordering::Relaxed),
+        unbox_boundary_calls: JIT_UNBOX_BOUNDARY_CALLS.load(Ordering::Relaxed),
+    }
+}
+
+pub fn jit_counter_reset() {
+    JIT_HELPER_CALLS.store(0, Ordering::Relaxed);
+    JIT_BOX_BOUNDARY_CALLS.store(0, Ordering::Relaxed);
+    JIT_UNBOX_BOUNDARY_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_counter_helper_call() {
+    JIT_HELPER_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_counter_box_boundary() {
+    JIT_BOX_BOUNDARY_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn jit_counter_unbox_boundary() {
+    JIT_UNBOX_BOUNDARY_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Enable or disable RC mode for JIT allocation helpers.
@@ -1824,7 +1880,14 @@ pub extern "C" fn jit_middleware_dispatch(request_bits: u64) -> u64 {
             let (chunk_idx, is_closure, closure_bits) = state.middleware[idx];
             let next_chunk_idx = state.next_chunk_idx;
             let rc_enabled = state.rc_enabled;
-            Some((chunk_idx, is_closure, closure_bits, next_chunk_idx, rc_enabled, false))
+            Some((
+                chunk_idx,
+                is_closure,
+                closure_bits,
+                next_chunk_idx,
+                rc_enabled,
+                false,
+            ))
         } else {
             let (chunk_idx, is_closure, closure_bits) = state.handler;
             let rc_enabled = state.rc_enabled;
@@ -1832,15 +1895,18 @@ pub extern "C" fn jit_middleware_dispatch(request_bits: u64) -> u64 {
         }
     });
 
-    let (chunk_idx, is_closure, closure_bits, next_chunk_idx, rc_enabled, is_handler) =
-        match action {
-            Some(info) => info,
-            None => return NV_UNIT,
-        };
+    let (chunk_idx, is_closure, closure_bits, next_chunk_idx, rc_enabled, is_handler) = match action
+    {
+        Some(info) => info,
+        None => return NV_UNIT,
+    };
 
     let fn_ptr = get_fn_ptr_from_table(chunk_idx);
     if fn_ptr.is_null() {
-        jit_set_error(format!("Middleware chain: function {} not found", chunk_idx));
+        jit_set_error(format!(
+            "Middleware chain: function {} not found",
+            chunk_idx
+        ));
         return NV_UNIT;
     }
 
@@ -1850,7 +1916,12 @@ pub extern "C" fn jit_middleware_dispatch(request_bits: u64) -> u64 {
     } else {
         // Middleware takes 2 args: (request, next)
         let next_nv = NValue::function(next_chunk_idx);
-        call_jit_fn(fn_ptr, closure_bits, is_closure, &[request_bits, next_nv.raw()])
+        call_jit_fn(
+            fn_ptr,
+            closure_bits,
+            is_closure,
+            &[request_bits, next_nv.raw()],
+        )
     };
 
     // Decrement index back (for correctness if next() is called multiple times)

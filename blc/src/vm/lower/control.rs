@@ -79,9 +79,11 @@ impl<'a> super::Lowerer<'a> {
 
         // Field assignment: b.field = val
         if left.kind() == "field_expression" {
-            let object_node = left.named_child(0)
+            let object_node = left
+                .named_child(0)
                 .ok_or_else(|| self.error("Field assignment missing object".into(), &left))?;
-            let field_node = left.named_child(1)
+            let field_node = left
+                .named_child(1)
                 .ok_or_else(|| self.error("Field assignment missing field".into(), &left))?;
             let object = self.node_text(&object_node);
             let field = self.node_text(&field_node);

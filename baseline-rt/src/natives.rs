@@ -24,6 +24,16 @@ fn args_from_raw(args: *const u64, count: u64) -> Vec<NValue> {
         .collect()
 }
 
+/// Read args as owned NValues from raw pointer + count.
+/// Uses `from_raw` to transfer one refcount per argument to this function.
+fn args_from_raw_owned(args: *const u64, count: u64) -> Vec<NValue> {
+    let slice = unsafe { std::slice::from_raw_parts(args, count as usize) };
+    slice
+        .iter()
+        .map(|&bits| unsafe { NValue::from_raw(bits) })
+        .collect()
+}
+
 /// Push an NValue to the arena and return its raw bits.
 fn push_result(val: NValue) -> u64 {
     let bits = val.raw();
@@ -475,28 +485,76 @@ pub extern "C" fn bl_list_reverse(args: *const u64, count: u64) -> u64 {
     }
 }
 
+fn list_sort_order(a: &NValue, b: &NValue) -> std::cmp::Ordering {
+    if a.is_any_int() && b.is_any_int() {
+        a.as_any_int().cmp(&b.as_any_int())
+    } else if a.is_float() && b.is_float() {
+        a.as_float()
+            .partial_cmp(&b.as_float())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    } else if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {
+        x.cmp(y)
+    } else {
+        std::cmp::Ordering::Equal
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bl_list_reverse_owning(args: *const u64, count: u64) -> u64 {
+    let mut vals = args_from_raw_owned(args, count);
+    let Some(list_val) = vals.pop() else {
+        return native_error("List.reverse: expected 1 arg".into());
+    };
+    match list_val.try_unwrap_heap() {
+        Ok(HeapObject::List(mut items)) => {
+            items.reverse();
+            push_result(NValue::list(items))
+        }
+        Ok(_) => native_error("List.reverse: expected List".into()),
+        Err(list_val) => match list_val.as_heap_ref() {
+            HeapObject::List(items) => {
+                let mut reversed = items.clone();
+                reversed.reverse();
+                push_result(NValue::list(reversed))
+            }
+            _ => native_error(format!("List.reverse: expected List, got {}", list_val)),
+        },
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn bl_list_sort(args: *const u64, count: u64) -> u64 {
     let vals = args_from_raw(args, count);
     match vals[0].as_list() {
         Some(items) => {
             let mut sorted = items.clone();
-            sorted.sort_by(|a, b| {
-                if a.is_any_int() && b.is_any_int() {
-                    a.as_any_int().cmp(&b.as_any_int())
-                } else if a.is_float() && b.is_float() {
-                    a.as_float()
-                        .partial_cmp(&b.as_float())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                } else if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {
-                    x.cmp(y)
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            });
+            sorted.sort_by(list_sort_order);
             push_result(NValue::list(sorted))
         }
         None => native_error(format!("List.sort: expected List, got {}", vals[0])),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bl_list_sort_owning(args: *const u64, count: u64) -> u64 {
+    let mut vals = args_from_raw_owned(args, count);
+    let Some(list_val) = vals.pop() else {
+        return native_error("List.sort: expected 1 arg".into());
+    };
+    match list_val.try_unwrap_heap() {
+        Ok(HeapObject::List(mut items)) => {
+            items.sort_by(list_sort_order);
+            push_result(NValue::list(items))
+        }
+        Ok(_) => native_error("List.sort: expected List".into()),
+        Err(list_val) => match list_val.as_heap_ref() {
+            HeapObject::List(items) => {
+                let mut sorted = items.clone();
+                sorted.sort_by(list_sort_order);
+                push_result(NValue::list(sorted))
+            }
+            _ => native_error(format!("List.sort: expected List, got {}", list_val)),
+        },
     }
 }
 
@@ -510,6 +568,47 @@ pub extern "C" fn bl_list_concat_native(args: *const u64, count: u64) -> u64 {
             push_result(NValue::list(result))
         }
         _ => native_error("List.concat: expected (List, List)".into()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bl_list_concat_native_owning(args: *const u64, count: u64) -> u64 {
+    let mut vals = args_from_raw_owned(args, count);
+    if vals.len() != 2 {
+        return native_error(format!("List.concat: expected 2 args, got {}", vals.len()));
+    }
+    let b_val = vals.pop().expect("checked len");
+    let a_val = vals.pop().expect("checked len");
+
+    let left = match a_val.try_unwrap_heap() {
+        Ok(HeapObject::List(items)) => Ok(items),
+        Ok(_) => Err(native_error("List.concat: expected List".into())),
+        Err(v) => match v.as_heap_ref() {
+            HeapObject::List(items) => Ok(items.clone()),
+            _ => Err(native_error(format!(
+                "List.concat: expected List, got {}",
+                v
+            ))),
+        },
+    };
+    let right = match b_val.try_unwrap_heap() {
+        Ok(HeapObject::List(items)) => Ok(items),
+        Ok(_) => Err(native_error("List.concat: expected List".into())),
+        Err(v) => match v.as_heap_ref() {
+            HeapObject::List(items) => Ok(items.clone()),
+            _ => Err(native_error(format!(
+                "List.concat: expected List, got {}",
+                v
+            ))),
+        },
+    };
+
+    match (left, right) {
+        (Ok(mut a_items), Ok(b_items)) => {
+            a_items.extend(b_items);
+            push_result(NValue::list(a_items))
+        }
+        (Err(err), _) | (_, Err(err)) => err,
     }
 }
 
@@ -735,6 +834,33 @@ pub extern "C" fn bl_map_insert(args: *const u64, count: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn bl_map_insert_owning(args: *const u64, count: u64) -> u64 {
+    let mut vals = args_from_raw_owned(args, count);
+    if vals.len() != 3 {
+        return native_error(format!("Map.insert: expected 3 args, got {}", vals.len()));
+    }
+    let val = vals.pop().expect("checked len");
+    let key = vals.pop().expect("checked len");
+    let map_val = vals.pop().expect("checked len");
+
+    match map_val.try_unwrap_heap() {
+        Ok(HeapObject::Map(mut entries)) => {
+            entries.insert(key, val);
+            push_result(NValue::map_from_hashmap(entries))
+        }
+        Ok(_) => native_error("Map.insert: expected Map".into()),
+        Err(map_val) => match map_val.as_heap_ref() {
+            HeapObject::Map(entries) => {
+                let mut new_map = entries.clone();
+                new_map.insert(key, val);
+                push_result(NValue::map_from_hashmap(new_map))
+            }
+            _ => native_error("Map.insert: expected Map".into()),
+        },
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn bl_map_get(args: *const u64, count: u64) -> u64 {
     let vals = args_from_raw(args, count);
     let key = &vals[1];
@@ -762,6 +888,32 @@ pub extern "C" fn bl_map_remove(args: *const u64, count: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn bl_map_remove_owning(args: *const u64, count: u64) -> u64 {
+    let mut vals = args_from_raw_owned(args, count);
+    if vals.len() != 2 {
+        return native_error(format!("Map.remove: expected 2 args, got {}", vals.len()));
+    }
+    let key = vals.pop().expect("checked len");
+    let map_val = vals.pop().expect("checked len");
+
+    match map_val.try_unwrap_heap() {
+        Ok(HeapObject::Map(mut entries)) => {
+            entries.remove(&key);
+            push_result(NValue::map_from_hashmap(entries))
+        }
+        Ok(_) => native_error("Map.remove: expected Map".into()),
+        Err(map_val) => match map_val.as_heap_ref() {
+            HeapObject::Map(entries) => {
+                let mut new_map = entries.clone();
+                new_map.remove(&key);
+                push_result(NValue::map_from_hashmap(new_map))
+            }
+            _ => native_error("Map.remove: expected Map".into()),
+        },
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn bl_map_contains(args: *const u64, count: u64) -> u64 {
     let vals = args_from_raw(args, count);
     let key = &vals[1];
@@ -784,6 +936,28 @@ pub extern "C" fn bl_map_keys(args: *const u64, count: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn bl_map_keys_owning(args: *const u64, count: u64) -> u64 {
+    let mut vals = args_from_raw_owned(args, count);
+    let Some(map_val) = vals.pop() else {
+        return native_error("Map.keys: expected 1 arg".into());
+    };
+    match map_val.try_unwrap_heap() {
+        Ok(HeapObject::Map(entries)) => {
+            let keys: Vec<_> = entries.into_iter().map(|(k, _)| k).collect();
+            push_result(NValue::list(keys))
+        }
+        Ok(_) => native_error("Map.keys: expected Map".into()),
+        Err(map_val) => match map_val.as_heap_ref() {
+            HeapObject::Map(entries) => {
+                let keys: Vec<_> = entries.keys().cloned().collect();
+                push_result(NValue::list(keys))
+            }
+            _ => native_error("Map.keys: expected Map".into()),
+        },
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn bl_map_values(args: *const u64, count: u64) -> u64 {
     let vals = args_from_raw(args, count);
     match vals[0].as_heap_ref() {
@@ -792,6 +966,28 @@ pub extern "C" fn bl_map_values(args: *const u64, count: u64) -> u64 {
             push_result(NValue::list(vals))
         }
         _ => native_error("Map.values: expected Map".into()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bl_map_values_owning(args: *const u64, count: u64) -> u64 {
+    let mut vals = args_from_raw_owned(args, count);
+    let Some(map_val) = vals.pop() else {
+        return native_error("Map.values: expected 1 arg".into());
+    };
+    match map_val.try_unwrap_heap() {
+        Ok(HeapObject::Map(entries)) => {
+            let vals: Vec<_> = entries.into_iter().map(|(_, v)| v).collect();
+            push_result(NValue::list(vals))
+        }
+        Ok(_) => native_error("Map.values: expected Map".into()),
+        Err(map_val) => match map_val.as_heap_ref() {
+            HeapObject::Map(entries) => {
+                let vals: Vec<_> = entries.values().cloned().collect();
+                push_result(NValue::list(vals))
+            }
+            _ => native_error("Map.values: expected Map".into()),
+        },
     }
 }
 
@@ -843,6 +1039,34 @@ pub extern "C" fn bl_map_entries(args: *const u64, count: u64) -> u64 {
             push_result(NValue::list(pairs))
         }
         _ => native_error("Map.entries: expected Map".into()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bl_map_entries_owning(args: *const u64, count: u64) -> u64 {
+    let mut vals = args_from_raw_owned(args, count);
+    let Some(map_val) = vals.pop() else {
+        return native_error("Map.entries: expected 1 arg".into());
+    };
+    match map_val.try_unwrap_heap() {
+        Ok(HeapObject::Map(entries)) => {
+            let pairs: Vec<_> = entries
+                .into_iter()
+                .map(|(k, v)| NValue::tuple(vec![k, v]))
+                .collect();
+            push_result(NValue::list(pairs))
+        }
+        Ok(_) => native_error("Map.entries: expected Map".into()),
+        Err(map_val) => match map_val.as_heap_ref() {
+            HeapObject::Map(entries) => {
+                let pairs: Vec<_> = entries
+                    .iter()
+                    .map(|(k, v)| NValue::tuple(vec![k.clone(), v.clone()]))
+                    .collect();
+                push_result(NValue::list(pairs))
+            }
+            _ => native_error("Map.entries: expected Map".into()),
+        },
     }
 }
 

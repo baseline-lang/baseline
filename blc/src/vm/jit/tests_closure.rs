@@ -101,7 +101,7 @@ fn jit_lambda_with_capture() {
                 ),
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
             // Helper function to prevent constant propagation of y
             IrFunction {
@@ -110,7 +110,7 @@ fn jit_lambda_with_capture() {
                 body: make_int(10),
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
         ],
         entry: 0,
@@ -203,7 +203,7 @@ fn jit_call_direct_function_as_value() {
                 ),
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
             IrFunction {
                 name: "double".into(),
@@ -211,7 +211,7 @@ fn jit_call_direct_function_as_value() {
                 body: make_binop(BinOp::Add, make_var("x"), make_var("x")),
                 ty: Some(Type::Int),
                 param_types: vec![],
-            span: dummy_span(),
+                span: dummy_span(),
             },
         ],
         entry: 0,

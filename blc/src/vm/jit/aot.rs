@@ -73,9 +73,9 @@ const AOT_NATIVE_SYMBOLS: &[(&str, &str)] = &[
     ("List.length", "bl_list_length"),
     ("List.head", "bl_list_head"),
     ("List.tail", "bl_list_tail"),
-    ("List.reverse", "bl_list_reverse"),
-    ("List.sort", "bl_list_sort"),
-    ("List.concat", "bl_list_concat_native"),
+    ("List.reverse", "bl_list_reverse_owning"),
+    ("List.sort", "bl_list_sort_owning"),
+    ("List.concat", "bl_list_concat_native_owning"),
     ("List.contains", "bl_list_contains"),
     // Option
     ("Option.unwrap", "bl_option_unwrap"),
@@ -101,15 +101,15 @@ const AOT_NATIVE_SYMBOLS: &[(&str, &str)] = &[
     ("Fs.list_dir", "bl_fs_list_dir"),
     // Map
     ("Map.empty", "bl_map_empty"),
-    ("Map.insert", "bl_map_insert"),
+    ("Map.insert", "bl_map_insert_owning"),
     ("Map.get", "bl_map_get"),
-    ("Map.remove", "bl_map_remove"),
+    ("Map.remove", "bl_map_remove_owning"),
     ("Map.contains", "bl_map_contains"),
-    ("Map.keys", "bl_map_keys"),
-    ("Map.values", "bl_map_values"),
+    ("Map.keys", "bl_map_keys_owning"),
+    ("Map.values", "bl_map_values_owning"),
     ("Map.len", "bl_map_len"),
     ("Map.from_list", "bl_map_from_list"),
-    ("Map.entries", "bl_map_entries"),
+    ("Map.entries", "bl_map_entries_owning"),
     // Set
     ("Set.empty", "bl_set_empty"),
     ("Set.insert", "bl_set_insert"),
@@ -186,6 +186,9 @@ fn collect_native_calls_expr(expr: &Expr, calls: &mut HashSet<String>) {
             collect_native_calls_expr(body, calls);
         }
         Expr::Let { value, .. } => collect_native_calls_expr(value, calls),
+        Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => {
+            collect_native_calls_expr(value, calls);
+        }
         Expr::Block(exprs, _) => {
             for e in exprs {
                 collect_native_calls_expr(e, calls);
@@ -256,6 +259,8 @@ fn collect_native_calls_expr(expr: &Expr, calls: &mut HashSet<String>) {
                 collect_native_calls_expr(a, calls);
             }
         }
+        Expr::Drop { body, .. } => collect_native_calls_expr(body, calls),
+        Expr::Reuse { alloc, .. } => collect_native_calls_expr(alloc, calls),
     }
 }
 
@@ -470,6 +475,7 @@ pub fn compile_to_object(module: &IrModule, trace: bool) -> Result<Vec<u8>, Stri
                 scalar_values: HashSet::new(),
                 rc_scope_stack: Vec::new(),
                 func_call_conv: CallConv::Fast,
+                jit_counters_enabled: false,
                 multireturn_fields: None,
                 multireturn_info: &[],
             };
@@ -897,6 +903,9 @@ fn collect_expr_strings(expr: &Expr, strings: &mut HashSet<String>) {
             collect_expr_strings(body, strings);
         }
         Expr::Let { value, .. } => {
+            collect_expr_strings(value, strings);
+        }
+        Expr::Assign { value, .. } | Expr::FieldAssign { value, .. } => {
             collect_expr_strings(value, strings);
         }
         Expr::Block(exprs, _) => {

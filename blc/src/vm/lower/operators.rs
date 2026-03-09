@@ -125,12 +125,12 @@ impl<'a> super::Lowerer<'a> {
             )
         }) || (self.is_string_expr(&lhs_node) && self.is_string_expr(&rhs_node));
 
-        let explicit_ty = self
-            .type_map
-            .as_ref()
-            .and_then(|tm| tm.get(&node.start_byte()).cloned());
+        // For comparison operators, the TypeMap result type is Bool (the comparison
+        // result), but the JIT needs the OPERAND type for codegen specialization
+        // (float ops vs int ops). Use operand-based detection for comparisons.
+        let is_comparison = matches!(op_text.as_str(), "==" | "!=" | "<" | ">" | "<=" | ">=");
 
-        let mut ty = explicit_ty.or({
+        let mut ty = if is_comparison {
             if both_int {
                 Some(Type::Int)
             } else if either_float {
@@ -140,7 +140,23 @@ impl<'a> super::Lowerer<'a> {
             } else {
                 None
             }
-        });
+        } else {
+            let explicit_ty = self
+                .type_map
+                .as_ref()
+                .and_then(|tm| tm.get(&node.start_byte()).cloned());
+            explicit_ty.or({
+                if both_int {
+                    Some(Type::Int)
+                } else if either_float {
+                    Some(Type::Float)
+                } else if both_string {
+                    Some(Type::String)
+                } else {
+                    None
+                }
+            })
+        };
 
         let op = match op_text.as_str() {
             "+" => BinOp::Add,
