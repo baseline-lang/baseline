@@ -204,20 +204,6 @@ impl NativeRegistry {
         self.name_index.insert(name, idx);
     }
 
-    #[allow(dead_code)]
-    fn register_with_arity(&mut self, name: &'static str, func: SimpleFn, arity: u8) {
-        let flags = Self::compute_flags(name);
-        let idx = self.entries.len() as u16;
-        self.entries.push(NativeEntry {
-            name,
-            func,
-            owning_func: None,
-            arity: Some(arity),
-            flags,
-        });
-        self.name_index.insert(name, idx);
-    }
-
     /// Register a native with both borrowed and owning (CoW) variants.
     fn register_owning(&mut self, name: &'static str, func: SimpleFn, owning: OwningFn) {
         let mut flags = Self::compute_flags(name);
@@ -819,10 +805,41 @@ impl NativeRegistry {
     }
 }
 
-fn native_server_listen_placeholder(_args: &[NValue]) -> Result<NValue, NativeError> {
-    Err(NativeError(
-        "Server.listen! must be executed by VM, not called directly".into(),
-    ))
+/// Thread-local stash for Server.listen! arguments.
+/// When a JIT program calls Server.listen!(router, port), the native stashes
+/// the arguments here and returns unit. After run_entry_nvalue() completes,
+/// main.rs checks this stash to enter server mode.
+use std::cell::RefCell;
+thread_local! {
+    static SERVER_LISTEN_STASH: RefCell<Option<(NValue, i64, Option<NValue>)>> = const { RefCell::new(None) };
+}
+
+/// Take the stashed Server.listen! arguments (router, port, optional config).
+pub fn take_server_listen_stash() -> Option<(NValue, i64, Option<NValue>)> {
+    SERVER_LISTEN_STASH.with(|stash| stash.borrow_mut().take())
+}
+
+fn native_server_listen_placeholder(args: &[NValue]) -> Result<NValue, NativeError> {
+    if args.len() < 2 {
+        return Err(NativeError(
+            "Server.listen! requires (router, port) arguments".into(),
+        ));
+    }
+    let router = args[0].clone();
+    let port = if args[1].is_any_int() {
+        args[1].as_any_int()
+    } else {
+        return Err(NativeError("Server.listen! port must be an integer".into()));
+    };
+    let config = if args.len() > 2 {
+        Some(args[2].clone())
+    } else {
+        None
+    };
+    SERVER_LISTEN_STASH.with(|stash| {
+        *stash.borrow_mut() = Some((router, port, config));
+    });
+    Ok(NValue::unit())
 }
 
 fn native_async_placeholder(_args: &[NValue]) -> Result<NValue, NativeError> {
@@ -1142,6 +1159,36 @@ mod tests {
             .1
             .as_any_int();
         assert_eq!(status, 429);
+    }
+
+    #[test]
+    fn response_redirect_status_302() {
+        let reg = NativeRegistry::new();
+        let id = reg.lookup("Response.redirect").unwrap();
+        let result = reg.call(id, &[NValue::string("/new".into())]).unwrap();
+        let fields = result.as_record().unwrap();
+        let status = fields
+            .iter()
+            .find(|(k, _)| &**k == "status")
+            .unwrap()
+            .1
+            .as_any_int();
+        assert_eq!(status, 302);
+    }
+
+    #[test]
+    fn response_redirect_permanent_status_301() {
+        let reg = NativeRegistry::new();
+        let id = reg.lookup("Response.redirect_permanent").unwrap();
+        let result = reg.call(id, &[NValue::string("/new".into())]).unwrap();
+        let fields = result.as_record().unwrap();
+        let status = fields
+            .iter()
+            .find(|(k, _)| &**k == "status")
+            .unwrap()
+            .1
+            .as_any_int();
+        assert_eq!(status, 301);
     }
 
     #[test]

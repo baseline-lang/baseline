@@ -1072,7 +1072,27 @@ async fn handle_request(
     if rc_enabled {
         std::mem::forget(request_nv);
     }
-    let response = call_with_middleware(middleware, handler, request_raw, rc_enabled, mw_next_idx);
+    let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        call_with_middleware(middleware, handler, request_raw, rc_enabled, mw_next_idx)
+    }));
+    let response = match response {
+        Ok(r) => r,
+        Err(panic) => {
+            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("[server] Handler panic: {}", msg);
+            // Reset heap state after panic
+            if !rc_enabled {
+                drop(helpers::jit_arena_drain());
+            }
+            None
+        }
+    };
 
     // Drain arena if not RC mode (free intermediate heap values)
     if !rc_enabled {
