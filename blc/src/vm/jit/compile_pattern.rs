@@ -958,7 +958,9 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         self.builder.switch_to_block(loop_body);
         self.builder.seal_block(loop_body);
 
-        // RC: decref previous iteration's binding value
+        // RC: decref previous iteration's binding value.
+        // Safe even if body captures the binding in a closure: jit_make_closure
+        // calls jit_take_arg (incref) for each captured value, keeping it alive.
         if self.rc_enabled {
             let old_bind = self.builder.use_var(bind_var);
             self.emit_decref(old_bind);
@@ -1007,6 +1009,15 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
 
     // -- Try expression compilation --
 
+    /// Compile a `try` (`?`) expression: propagate Err/None by early return.
+    ///
+    /// # Invariant
+    ///
+    /// The inner expression must produce a flat `Result<T,E>` or `Option<T>`, never
+    /// a nested type like `Result<Option<T>,E>`. Both `jit_is_err` and `jit_is_none`
+    /// are checked unconditionally — a nested `Ok(None)` would incorrectly trigger
+    /// early return. The IR lowerer guarantees this by only emitting `Try` for
+    /// direct `?` on Result/Option expressions.
     pub(super) fn compile_try(&mut self, inner: &Expr) -> Result<CValue, String> {
         let val = self.compile_expr(inner)?;
 

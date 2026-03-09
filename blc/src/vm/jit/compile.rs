@@ -63,6 +63,10 @@ pub(super) struct FnCompileCtx<'a, 'b, M: Module> {
     /// Whether RC codegen is enabled (scope-based incref/decref).
     pub(super) rc_enabled: bool,
     /// Values known to be scalar (Int/Float/Bool/Unit) — skip RC incref/decref for these.
+    ///
+    /// Uses Cranelift SSA `Value` indices which are unique per function (never reused).
+    /// Stale entries from prior blocks are harmless: a `Value` from block A that appears
+    /// in block B refers to the same SSA definition, so the scalar property still holds.
     pub(super) scalar_values: HashSet<CValue>,
     /// Stack of scope frames tracking owned variables for RC cleanup.
     /// Each frame is a list of Variables whose values should be decref'd on scope exit.
@@ -951,6 +955,8 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
 
     /// Spill values to a stack slot and return the address.
     /// Reuses a scratch slot when possible to avoid creating many stack slots.
+    /// The slot grows monotonically (never shrinks) — acceptable trade-off since
+    /// stack frames are cheap and the waste is bounded by the largest single spill.
     fn spill_to_stack(&mut self, values: &[CValue]) -> CValue {
         let size = (values.len() * 8) as u32;
         let slot = match self.scratch_slot {
@@ -1529,7 +1535,11 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
             }
         }
 
-        // Compile condition and base case in unboxed mode
+        // Compile condition and base case in unboxed mode.
+        // Eager evaluation of base_expr is safe here because is_simple_base_case()
+        // restricts it to pure scalar expressions (literals, params, arithmetic) —
+        // no side effects possible. If the predicate is ever loosened to include
+        // GetField or CallDirect, base_expr must be compiled inside a branch block.
         let cond_val = self.compile_expr_unboxed(cond_expr)?;
         let base_val = self.compile_expr_unboxed(base_expr)?;
 
@@ -2145,7 +2155,8 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 let a_val = self.compile_expr(a)?;
                 let false_val = self.builder.ins().iconst(types::I64, NV_FALSE as i64);
                 let cmp = self.is_truthy(a_val);
-                // RC: is_truthy borrows a_val; decref the owned value now
+                // RC: And/Or semantics discard the original value — the result is
+                // either b_val or a fresh bool constant. Decref a_val now.
                 if self.rc_enabled {
                     self.emit_decref(a_val);
                 }
@@ -2172,7 +2183,8 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
                 let a_val = self.compile_expr(a)?;
                 let true_val = self.builder.ins().iconst(types::I64, NV_TRUE as i64);
                 let cmp = self.is_truthy(a_val);
-                // RC: is_truthy borrows a_val; decref the owned value now
+                // RC: And/Or semantics discard the original value — the result is
+                // either b_val or a fresh bool constant. Decref a_val now.
                 if self.rc_enabled {
                     self.emit_decref(a_val);
                 }
@@ -3038,6 +3050,8 @@ impl<'a, 'b, M: Module> FnCompileCtx<'a, 'b, M> {
         // Function path: call_indirect(sig_N, fn_ptr, [args...])
         self.builder.switch_to_block(function_block);
         self.builder.seal_block(function_block);
+        // jit_function_fn_ptr borrows callee_val (borrow_from_raw) — no ownership transfer.
+        // We still own callee_val and must decref it below after the call.
         let fn_ptr_f = self.call_helper("jit_function_fn_ptr", &[callee_val]);
         let zero_f = self.builder.ins().iconst(types::I64, 0);
         let ptr_ok_f = self.builder.ins().icmp(IntCC::NotEqual, fn_ptr_f, zero_f);

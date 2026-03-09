@@ -9,9 +9,93 @@ use super::super::ir::{Expr, IrFunction, IrModule, MatchArm, Matcher, Pattern};
 use super::super::natives::NativeRegistry;
 use crate::analysis::types::Type;
 
+/// Higher-order functions that are inlined as Cranelift loops by the JIT.
+/// Referenced in both AOT and JIT paths of `expr_can_jit`.
+const INLINE_HOFS: &[&str] = &[
+    "List.map",
+    "List.filter",
+    "List.fold",
+    "List.find",
+    "Map.map",
+    "Map.filter",
+    "Map.fold",
+    "Option.map",
+    "Result.map",
+    "Result.map_err",
+];
+
 /// Check if a function can be JIT-compiled.
 pub(super) fn can_jit(func: &IrFunction, natives: Option<&NativeRegistry>) -> bool {
     expr_can_jit(&func.body, natives)
+}
+
+/// Check if a function can be JIT-compiled, returning the unsupported
+/// expression kind on failure.
+pub(super) fn can_jit_reason(
+    func: &IrFunction,
+    natives: Option<&NativeRegistry>,
+) -> Result<(), &'static str> {
+    if expr_can_jit(&func.body, natives) {
+        Ok(())
+    } else {
+        Err(find_unsupported_expr(&func.body, natives))
+    }
+}
+
+/// Find the first expression kind that prevents JIT compilation.
+fn find_unsupported_expr(expr: &Expr, natives: Option<&NativeRegistry>) -> &'static str {
+    if !expr_can_jit(expr, natives) {
+        expr_kind_name(expr)
+    } else {
+        "unknown"
+    }
+}
+
+fn expr_kind_name(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Int(_) => "Int",
+        Expr::Float(_) => "Float",
+        Expr::Bool(_) => "Bool",
+        Expr::Unit => "Unit",
+        Expr::String(_) => "String",
+        Expr::Hole => "Hole",
+        Expr::Var(_, _) => "Var",
+        Expr::BinOp { .. } => "BinOp",
+        Expr::UnaryOp { .. } => "UnaryOp",
+        Expr::If { .. } => "If",
+        Expr::CallDirect { .. } => "CallDirect",
+        Expr::TailCall { .. } => "TailCall",
+        Expr::Let { .. } => "Let",
+        Expr::Block(_, _) => "Block",
+        Expr::And(_, _) => "And",
+        Expr::Or(_, _) => "Or",
+        Expr::Concat(_) => "Concat",
+        Expr::CallNative { .. } => "CallNative",
+        Expr::MakeEnum { .. } => "MakeEnum",
+        Expr::MakeStruct { .. } => "MakeStruct",
+        Expr::MakeList(_, _) => "MakeList",
+        Expr::MakeRecord(_, _) => "MakeRecord",
+        Expr::MakeTuple(_, _) => "MakeTuple",
+        Expr::MakeRange(_, _) => "MakeRange",
+        Expr::UpdateRecord { .. } => "UpdateRecord",
+        Expr::GetField { .. } => "GetField",
+        Expr::Match { .. } => "Match",
+        Expr::For { .. } => "For",
+        Expr::Try { .. } => "Try",
+        Expr::MakeClosure { .. } => "MakeClosure",
+        Expr::GetClosureVar(_) => "GetClosureVar",
+        Expr::Lambda { .. } => "Lambda",
+        Expr::CallIndirect { .. } => "CallIndirect",
+        Expr::TailCallIndirect { .. } => "TailCallIndirect",
+        Expr::Expect { .. } => "Expect",
+        Expr::Drop { .. } => "Drop",
+        Expr::Reuse { .. } => "Reuse",
+        Expr::WithHandlers { .. } => "WithHandlers",
+        Expr::HandleEffect { .. } => "HandleEffect",
+        Expr::PerformEffect { .. } => "PerformEffect",
+        Expr::Assign { .. } => "Assign",
+        Expr::FieldAssign { .. } => "FieldAssign",
+    }
 }
 
 /// Check if an expression contains a self-tail-call to the given function name.
@@ -91,19 +175,7 @@ pub(super) fn expr_can_jit(expr: &Expr, natives: Option<&NativeRegistry>) -> boo
             if natives.is_none() {
                 #[cfg(feature = "aot")]
                 {
-                    let is_hof = matches!(
-                        qualified.as_str(),
-                        "List.map"
-                            | "List.filter"
-                            | "List.fold"
-                            | "List.find"
-                            | "Map.map"
-                            | "Map.filter"
-                            | "Map.fold"
-                            | "Option.map"
-                            | "Result.map"
-                            | "Result.map_err"
-                    );
+                    let is_hof = INLINE_HOFS.contains(&qualified.as_str());
                     if !is_hof && super::aot::aot_native_symbol(&qualified).is_none() {
                         return false;
                     }
@@ -118,19 +190,7 @@ pub(super) fn expr_can_jit(expr: &Expr, natives: Option<&NativeRegistry>) -> boo
                 return false;
             };
             // Inline HOFs are always allowed (compiled as pure IR in stdlib)
-            let is_inline_hof = matches!(
-                qualified.as_str(),
-                "List.map"
-                    | "List.filter"
-                    | "List.fold"
-                    | "List.find"
-                    | "Map.map"
-                    | "Map.filter"
-                    | "Map.fold"
-                    | "Option.map"
-                    | "Result.map"
-                    | "Result.map_err"
-            );
+            let is_inline_hof = INLINE_HOFS.contains(&qualified.as_str());
             if is_inline_hof {
                 return args.iter().all(|a| expr_can_jit(a, natives));
             }
@@ -318,7 +378,7 @@ fn collect_called_functions(expr: &Expr, out: &mut Vec<String>) {
 /// Uses fixed-point iteration to handle mutual recursion.
 /// Collect function names that are referenced as values (not just called directly).
 /// These functions may be called via CallIndirect and must use boxed ABI.
-fn collect_indirect_targets(module: &IrModule) -> std::collections::HashSet<String> {
+pub(super) fn collect_indirect_targets(module: &IrModule) -> std::collections::HashSet<String> {
     let func_name_set: std::collections::HashSet<&str> =
         module.functions.iter().map(|f| f.name.as_str()).collect();
     let mut targets = std::collections::HashSet::new();
@@ -472,16 +532,16 @@ fn collect_indirect_targets_expr(
     }
 }
 
-pub(super) fn compute_unboxed_flags(module: &IrModule) -> Vec<bool> {
+pub(super) fn compute_unboxed_flags(
+    module: &IrModule,
+    indirect_targets: &std::collections::HashSet<String>,
+) -> Vec<bool> {
     let func_names: HashMap<String, usize> = module
         .functions
         .iter()
         .enumerate()
         .map(|(idx, f)| (f.name.clone(), idx))
         .collect();
-
-    // Functions that can be called indirectly must stay boxed
-    let indirect_targets = collect_indirect_targets(module);
 
     // Start optimistic: all scalar-only non-entry functions are candidates.
     // The entry function stays boxed to preserve correct NaN-boxing for the caller.
@@ -570,9 +630,10 @@ fn record_scalar_fields(ty: &Type) -> Option<Vec<String>> {
 /// 2. It's not the entry function
 /// 3. It's not used as an indirect call target (closure, passed as value)
 /// 4. It's not a lambda
-pub(super) fn compute_multireturn_info(module: &IrModule) -> Vec<Option<Vec<String>>> {
-    let indirect_targets = collect_indirect_targets(module);
-
+pub(super) fn compute_multireturn_info(
+    module: &IrModule,
+    indirect_targets: &std::collections::HashSet<String>,
+) -> Vec<Option<Vec<String>>> {
     module
         .functions
         .iter()

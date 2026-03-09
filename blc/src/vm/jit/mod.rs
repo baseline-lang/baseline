@@ -24,6 +24,8 @@ mod tests;
 #[cfg(test)]
 mod tests_closure;
 #[cfg(test)]
+mod tests_codegen;
+#[cfg(test)]
 mod tests_pattern;
 #[cfg(test)]
 mod tests_rc;
@@ -44,7 +46,8 @@ use super::natives::NativeRegistry;
 use super::nvalue::NValue;
 
 use analysis::{
-    can_jit, compute_multireturn_info, compute_unboxed_flags, has_self_tail_call, is_scalar_only,
+    can_jit, can_jit_reason, collect_indirect_targets, compute_multireturn_info,
+    compute_unboxed_flags, has_self_tail_call, is_scalar_only,
 };
 use compile::FnCompileCtx;
 use helpers::*;
@@ -54,8 +57,19 @@ pub use helpers::jit_take_error;
 type EntryFn = unsafe extern "C" fn() -> u64;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum JitError {
+    /// Generic error with a freeform message.
     Message(String),
+    /// A helper function was not found during symbol registration.
+    HelperNotFound(String),
+    /// Cranelift codegen or module error.
+    CraneliftError(String),
+    /// An IR expression is not supported by the JIT.
+    UnsupportedExpr {
+        expr_kind: &'static str,
+        func_name: String,
+    },
 }
 
 impl From<String> for JitError {
@@ -74,6 +88,18 @@ impl fmt::Display for JitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message(msg) => write!(f, "{}", msg),
+            Self::HelperNotFound(name) => write!(f, "JIT helper not found: {}", name),
+            Self::CraneliftError(msg) => write!(f, "Cranelift error: {}", msg),
+            Self::UnsupportedExpr {
+                expr_kind,
+                func_name,
+            } => {
+                write!(
+                    f,
+                    "unsupported expression '{}' in function '{}'",
+                    expr_kind, func_name
+                )
+            }
         }
     }
 }
@@ -82,6 +108,13 @@ type JitResult<T> = Result<T, JitError>;
 
 /// A JIT-compiled program. Holds the compiled module and a dispatch table
 /// mapping function index → native function pointer.
+///
+/// # Safety invariant
+///
+/// Callers must not retain or call pointers obtained from `dispatch`, `fn_table`,
+/// or `get_fn()` beyond the lifetime of this `JitProgram`. The raw `*const u8`
+/// entries point into memory-mapped code pages owned by `_module`; accessing
+/// them after the program is dropped is undefined behavior.
 pub struct JitProgram {
     /// Owns the compiled code pages (leaked on drop by Cranelift's design —
     /// see cranelift-jit Memory::drop which calls mem::forget on allocations).
@@ -242,6 +275,11 @@ impl JitProgram {
 
     /// Execute the entry function (must be a 0-arg function returning i64).
     /// Legacy interface: extracts an Int from NaN-boxed result.
+    ///
+    /// **Warning:** Falls through to raw bit reinterpretation for non-int non-bool
+    /// values (e.g., record pointers become garbage i64). Prefer `run_entry_nvalue`
+    /// for type-safe access.
+    #[deprecated(note = "use run_entry_nvalue for type-safe results")]
     pub fn run_entry(&self) -> Option<i64> {
         let nv = self.run_entry_nvalue()?;
         if nv.is_int() {
@@ -406,35 +444,37 @@ pub fn compile_with_natives(
 }
 
 fn selected_jit_call_conv() -> JitResult<CallConv> {
-    match std::env::var("BLC_JIT_CALL_CONV") {
-        Ok(raw) => {
-            let value = raw.trim().to_ascii_lowercase();
-            match value.as_str() {
-                "tail" => Ok(CallConv::Tail),
-                "fast" => Ok(CallConv::Fast),
-                _ => Err(JitError::from(format!(
-                    "Invalid BLC_JIT_CALL_CONV='{}'. Expected 'tail' or 'fast'.",
-                    raw
-                ))),
+    static CACHED: std::sync::LazyLock<Result<CallConv, String>> = std::sync::LazyLock::new(|| {
+        match std::env::var("BLC_JIT_CALL_CONV") {
+            Ok(raw) => {
+                let value = raw.trim().to_ascii_lowercase();
+                match value.as_str() {
+                    "tail" => Ok(CallConv::Tail),
+                    "fast" => Ok(CallConv::Fast),
+                    _ => Err(format!(
+                        "Invalid BLC_JIT_CALL_CONV='{}'. Expected 'tail' or 'fast'.",
+                        raw
+                    )),
+                }
             }
+            Err(std::env::VarError::NotPresent) => Ok(CallConv::Tail),
+            Err(e) => Err(format!("Failed to read BLC_JIT_CALL_CONV: {}", e)),
         }
-        Err(std::env::VarError::NotPresent) => Ok(CallConv::Tail),
-        Err(e) => Err(JitError::from(format!(
-            "Failed to read BLC_JIT_CALL_CONV: {}",
-            e
-        ))),
-    }
+    });
+    CACHED.clone().map_err(JitError::from)
 }
 
 fn jit_counters_enabled() -> bool {
-    match std::env::var("BLC_JIT_COUNTERS") {
-        Ok(raw) => {
-            let value = raw.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    static CACHED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        match std::env::var("BLC_JIT_COUNTERS") {
+            Ok(raw) => {
+                let value = raw.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            }
+            Err(_) => false,
         }
-        Err(std::env::VarError::NotPresent) => false,
-        Err(_) => false,
-    }
+    });
+    *CACHED
 }
 
 fn compile_inner(
@@ -486,11 +526,14 @@ fn compile_inner(
     // Heap roots collected during compilation (string constants, tag names, etc.)
     let mut heap_roots: Vec<NValue> = Vec::new();
 
+    // Compute indirect targets once, shared by unboxed and multi-return analysis
+    let indirect_targets = collect_indirect_targets(module);
+
     // Compute unboxed flags (scalar-only functions with scalar-only callees)
-    let unboxed_flags = compute_unboxed_flags(module);
+    let unboxed_flags = compute_unboxed_flags(module, &indirect_targets);
 
     // Compute multi-return info (functions returning all-scalar records)
-    let multireturn_info = compute_multireturn_info(module);
+    let multireturn_info = compute_multireturn_info(module, &indirect_targets);
 
     // Phase 1: Declare all functions
     let mut func_ids: Vec<Option<FuncId>> = Vec::with_capacity(module.functions.len());
@@ -518,7 +561,13 @@ fn compile_inner(
             func_ids.push(None);
             compilable.push(false);
             if trace {
-                eprintln!("JIT: fallback for '{}' (unsupported constructs)", func.name);
+                let reason = can_jit_reason(func, natives)
+                    .err()
+                    .unwrap_or("unknown");
+                eprintln!(
+                    "JIT: fallback for '{}' (unsupported: {})",
+                    func.name, reason
+                );
             }
         }
     }
@@ -778,7 +827,7 @@ fn compile_inner(
     let entry_wrapper_id = if compilable.get(module.entry).copied().unwrap_or(false) {
         let entry_func_id = func_ids[module.entry]
             .ok_or_else(|| "JIT: entry function was not compiled".to_string())?;
-        let id = create_entry_wrapper(&mut jit_module, &mut fb_ctx, entry_func_id, func_call_conv)?;
+        let id = create_entry_wrapper(&mut jit_module, &mut fb_ctx, entry_func_id)?;
         if trace {
             eprintln!(
                 "JIT: created entry wrapper (platform CC → {:?})",
@@ -880,7 +929,6 @@ fn create_entry_wrapper(
     jit_module: &mut JITModule,
     fb_ctx: &mut FunctionBuilderContext,
     entry_func_id: FuncId,
-    _entry_call_conv: CallConv,
 ) -> Result<FuncId, String> {
     let mut wrapper_sig = jit_module.make_signature();
     wrapper_sig.returns.push(AbiParam::new(types::I64));
@@ -1319,4 +1367,33 @@ pub(super) fn make_helper_sig<M: Module>(
         _ => return Err(format!("JIT: unknown runtime helper '{}'", name)),
     }
     Ok(sig)
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn helper_symbols_and_sigs_are_in_sync() {
+        let mut jit_module = {
+            let flag_builder = settings::builder();
+            let isa_builder = cranelift_native::builder().unwrap();
+            let isa = isa_builder
+                .finish(settings::Flags::new(flag_builder))
+                .unwrap();
+            let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+            JITModule::new(builder)
+        };
+        let ptr_type = jit_module.target_config().pointer_type();
+
+        for (name, _ptr) in HELPER_SYMBOLS {
+            let result = make_helper_sig(&mut jit_module, name, ptr_type);
+            assert!(
+                result.is_ok(),
+                "HELPER_SYMBOLS entry '{}' has no make_helper_sig match: {:?}",
+                name,
+                result.err()
+            );
+        }
+    }
 }

@@ -16,7 +16,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use super::super::ir::{Expr, IrModule};
 use super::super::nvalue::{PAYLOAD_MASK, TAG_INT};
-use super::analysis::{can_jit, compute_unboxed_flags, has_self_tail_call};
+use super::analysis::{can_jit, collect_indirect_targets, compute_unboxed_flags, has_self_tail_call};
 use super::compile::FnCompileCtx;
 use super::{helper_names, make_helper_sig};
 
@@ -306,7 +306,8 @@ pub fn compile_to_object(module: &IrModule, trace: bool) -> Result<Vec<u8>, Stri
     let mut obj_module = ObjectModule::new(obj_builder);
     let ptr_type = obj_module.target_config().pointer_type();
 
-    let unboxed_flags = compute_unboxed_flags(module);
+    let indirect_targets = collect_indirect_targets(module);
+    let unboxed_flags = compute_unboxed_flags(module, &indirect_targets);
 
     // --- Declare runtime helpers as imports (linked from libbaseline_rt) ---
     let mut helper_ids: HashMap<&str, FuncId> = HashMap::new();

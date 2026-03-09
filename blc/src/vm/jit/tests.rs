@@ -1,4 +1,4 @@
-use super::analysis::{can_jit, compute_unboxed_flags};
+use super::analysis::{can_jit, collect_indirect_targets, compute_unboxed_flags};
 use super::compile::FnCompileCtx;
 use super::*;
 use crate::analysis::types::Type;
@@ -308,7 +308,8 @@ fn jit_unboxed_bool_recursive_helper_from_main() {
         entry: 1,
         tags: TagRegistry::new(),
     };
-    let unboxed = compute_unboxed_flags(&module);
+    let indirect = collect_indirect_targets(&module);
+    let unboxed = compute_unboxed_flags(&module, &indirect);
     assert!(unboxed[0], "helper should be unboxed");
     assert!(!unboxed[1], "entry must stay boxed");
     assert!(compile_and_run_bool(&module));
@@ -348,7 +349,8 @@ fn jit_unboxed_bool_param_boundary_from_main() {
         tags: TagRegistry::new(),
     };
 
-    let unboxed = compute_unboxed_flags(&module);
+    let indirect = collect_indirect_targets(&module);
+    let unboxed = compute_unboxed_flags(&module, &indirect);
     assert!(unboxed[0], "check_flag should be unboxed");
     assert!(!unboxed[1], "entry must stay boxed");
     assert_eq!(compile_and_run(&module), 2);
