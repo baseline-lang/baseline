@@ -66,6 +66,13 @@ blc run fasta/1.bl -- 1000
 # Diff against bench/algorithm/fasta/1000_out
 ```
 
+From the Baseline repository root, you can run deterministic byte-for-byte checks
+against committed reference outputs with:
+
+```bash
+./benchmarks/hanabi/verify_outputs.sh
+```
+
 ### 6. Submit PR
 
 ```bash

@@ -1,0 +1,17 @@
+@prelude(server)
+
+fn health(req: Request) -> {Http} Result<Response, HttpError> =
+  Ok(Response.json("{\"status\":\"ok\"}"))
+
+fn echo(req: Request) -> {Http} Result<Response, HttpError> =
+  Ok(Response.ok(req.body))
+
+fn not_found_handler(req: Request) -> {Http} Result<Response, HttpError> =
+  Err(HttpError.not_found("resource not found"))
+
+fn main!() -> {Http} () =
+  Router.new()
+    |> Router.get("/health", health)
+    |> Router.post("/echo", echo)
+    |> Router.get("/error", not_found_handler)
+    |> Server.listen!(18199)

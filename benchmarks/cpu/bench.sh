@@ -6,6 +6,7 @@
 #   ./benchmarks/cpu/bench.sh          # Run all benchmarks
 #   ./benchmarks/cpu/bench.sh fib      # Run only fib
 #   ./benchmarks/cpu/bench.sh --save   # Save current results as new reference
+#   ./benchmarks/cpu/bench_heap.sh     # Heap-focused pre/post optimization gate
 #
 # Exit codes: 0 = ok, 1 = regression (>10% slower)
 
@@ -41,9 +42,9 @@ echo -e "${CYAN}Building blc (release)...${NC}"
 (cd "$REPO_DIR" && cargo build --release --bin blc 2>&1 | tail -1)
 BLC="$REPO_DIR/target/release/blc"
 
-# Detect JIT availability (must produce correct output, not just exit 0)
+# Detect default runtime availability (blc run is JIT-backed by default)
 HAS_JIT=false
-JIT_OUT=$($BLC run --jit "$SCRIPT_DIR/fib/fib.bl" 2>/dev/null || true)
+JIT_OUT=$($BLC run "$SCRIPT_DIR/fib/fib.bl" 2>/dev/null || true)
 if [ "$JIT_OUT" = "9227465" ]; then
     HAS_JIT=true
 fi

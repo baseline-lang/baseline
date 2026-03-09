@@ -1,0 +1,62 @@
+{
+  "timestamp": "2026-03-08T16:59:49Z",
+  "system": "arm64 Darwin 26.2",
+  "runs": 3,
+  "results": [
+    {
+      "lang": "baseline_jit",
+      "bench": "mapbuild",
+      "time_s": 0.052,
+      "mem_kb": 138960,
+      "allocs": 0,
+      "frees": 0,
+      "reuses": 0,
+      "live": 0,
+      "output": "24396494"
+    },
+    {
+      "lang": "baseline_jit",
+      "bench": "mergesort",
+      "time_s": 0.22,
+      "mem_kb": 246752,
+      "allocs": 0,
+      "frees": 0,
+      "reuses": 0,
+      "live": 0,
+      "output": "96"
+    },
+    {
+      "lang": "baseline_jit",
+      "bench": "strrev",
+      "time_s": 0.015,
+      "mem_kb": 14128,
+      "allocs": 0,
+      "frees": 0,
+      "reuses": 0,
+      "live": 0,
+      "output": "1000"
+    },
+    {
+      "lang": "baseline_jit",
+      "bench": "tak",
+      "time_s": 0.077,
+      "mem_kb": 13744,
+      "allocs": 0,
+      "frees": 0,
+      "reuses": 0,
+      "live": 0,
+      "output": "11"
+    },
+    {
+      "lang": "baseline_jit",
+      "bench": "treemap",
+      "time_s": 0.156,
+      "mem_kb": 57440,
+      "allocs": 0,
+      "frees": 0,
+      "reuses": 0,
+      "live": 0,
+      "output": "3156690788"
+    }
+  ]
+}

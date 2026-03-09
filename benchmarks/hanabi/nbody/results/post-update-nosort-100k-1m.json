@@ -1,0 +1,52 @@
+{
+  "timestamp": "2026-03-07T04:21:55Z",
+  "system": "arm64 Darwin 25.2.0",
+  "runs": 5,
+  "inputs": [
+    100000,
+    1000000
+  ],
+  "correctness_inputs": [
+    1000
+  ],
+  "baseline_compiled_enabled": false,
+  "commands": {
+    "baseline_source": "/Users/alastair/work/baseline/target/release/blc run /Users/alastair/work/baseline/benchmarks/hanabi/nbody/nbody.bl -- <N>",
+    "baseline_compiled": null,
+    "c_opt": "/Users/alastair/work/baseline/benchmarks/hanabi/nbody/nbody_c_opt <N>"
+  },
+  "results": [
+    {
+      "variant": "c_opt",
+      "input": 100000,
+      "time_s": 0.016599,
+      "min_s": 0.015686,
+      "max_s": 0.017379,
+      "ratio_vs_c_opt": 1.0
+    },
+    {
+      "variant": "baseline_source",
+      "input": 100000,
+      "time_s": 0.595596,
+      "min_s": 0.574022,
+      "max_s": 0.602625,
+      "ratio_vs_c_opt": 35.881
+    },
+    {
+      "variant": "c_opt",
+      "input": 1000000,
+      "time_s": 0.044106,
+      "min_s": 0.04248,
+      "max_s": 0.047498,
+      "ratio_vs_c_opt": 1.0
+    },
+    {
+      "variant": "baseline_source",
+      "input": 1000000,
+      "time_s": 5.317406,
+      "min_s": 5.270728,
+      "max_s": 5.411572,
+      "ratio_vs_c_opt": 120.559
+    }
+  ]
+}

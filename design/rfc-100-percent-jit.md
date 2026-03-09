@@ -4,6 +4,10 @@
 **Date:** 2026-02-22
 **Motivation:** Hanabi benchmark submission requires correct output. The JIT currently segfaults on all three non-trivial benchmarks (binarytrees, nbody, fasta). The VM is 20-50x slower than CPython on these workloads, making the JIT the only viable competition backend.
 
+> Status note (2026-03-09): This RFC is retained as historical design context.
+> For the current source-verified implementation status and roadmap, use
+> `docs/jit-complete-review.md` as the primary JIT review document.
+
 ---
 
 ## Problem
