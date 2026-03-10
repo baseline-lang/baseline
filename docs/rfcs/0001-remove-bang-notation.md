@@ -10,18 +10,22 @@ Remove the `!` suffix convention from effectful function names and call sites. E
 
 ## Motivation
 
-Today, Baseline uses two parallel mechanisms to mark effectful code:
+Baseline's effect system is a **capability system**. When a function declares `-> {Http} String`, it states: "I require the Http capability." The compiler's job is to verify that every function has permission to use the capabilities it needs — not to classify what *kind* of state change occurs.
 
-1. **Type-level effect sets** in function signatures: `fn fetch(url: String) -> {Http} String`
+An `Http.get` call isn't interesting because it "causes a side effect" in some abstract sense. It's interesting because the function is reaching out to the network, and the caller needs to know that. Whether the call reads or writes, whether it changes local memory or remote state — those are runtime concerns. The type system cares about one thing: **did you declare that you need this capability?**
+
+Today, Baseline encodes this in two redundant ways:
+
+1. **Type-level capability sets** in function signatures: `fn fetch(url: String) -> {Http} String`
 2. **Bang suffix** on identifiers: `Http.get!(url)`, `fn main!()`
 
-This redundancy creates problems:
+The signature is the contract. The `!` is a per-call-site echo of that contract — and it's the wrong level of abstraction:
 
-- **Noise.** The `!` appears on every effectful call site. In a typical server handler, nearly every line ends with `!`, adding visual clutter without conveying new information — the effect set in the signature already tells you what effects a function uses.
-- **False sense of granularity.** The `!` marks *that* a call is effectful but not *which* effect. The signature `-> {Http, Console} T` is strictly more informative.
-- **Friction for LLM generation.** Baseline's design philosophy is "LLM-native." The bang is an extra token that generators must remember to attach, and forgetting it produces a confusing grammar error rather than a type error.
-- **Conflation of naming and typing.** Whether a function is effectful is a property of its *type*, not its *name*. Encoding it in the name forces renaming when effect signatures change (e.g., wrapping a pure function to add logging).
-- **Precedent.** Languages with mature effect systems (Koka, Eff, Frank, Unison) do not require a naming convention — effects are tracked structurally in the type system.
+- **Capabilities belong at boundaries, not call sites.** The signature `-> {Http, Console} T` declares what a function is *allowed to do*. Repeating that information on every call with `!` adds noise without adding safety. In a typical server handler, nearly every line ends with `!`.
+- **The bang says "effect" but not "which capability."** It marks *that* a call is effectful but not *which* capability it requires. The signature is strictly more informative.
+- **Naming is not typing.** Whether a function needs the Http capability is a property of its *type*, not its *name*. Encoding it in the name forces renaming when capability requirements change (e.g., wrapping a pure function to add logging).
+- **LLM friction.** Baseline's design philosophy is "LLM-native." The bang is an extra token that generators must remember to attach, and forgetting it produces a grammar error rather than a type error.
+- **Precedent.** Languages with mature effect systems (Koka, Eff, Frank, Unison) do not require a naming convention — capabilities are tracked structurally in the type system.
 
 ## Current Behavior
 
