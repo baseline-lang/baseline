@@ -434,20 +434,32 @@ fn parse_equality_constraint(node: Node, source: &str) -> Option<StringConstrain
     if children.len() < 3 {
         return None;
     }
-    // One side should be `self` or identifier, the other a string literal
-    let lhs = children[0].utf8_text(source.as_bytes()).unwrap_or("");
-    let rhs = children[2].utf8_text(source.as_bytes()).unwrap_or("");
 
-    // Check if either side is a string literal
-    if children[2].kind() == "string" || children[2].kind() == "string_literal" {
-        let val = rhs.trim_matches('"');
-        return Some(StringConstraint::Equals(val.to_string()));
+    // Check if either side is a string literal (may be wrapped in "literal" node)
+    if let Some(val) = extract_string_from_node(children[2], source) {
+        return Some(StringConstraint::Equals(val));
     }
-    if children[0].kind() == "string" || children[0].kind() == "string_literal" {
-        let val = lhs.trim_matches('"');
-        return Some(StringConstraint::Equals(val.to_string()));
+    if let Some(val) = extract_string_from_node(children[0], source) {
+        return Some(StringConstraint::Equals(val));
     }
     None
+}
+
+/// Extract a plain string value from a node that may be a string_literal,
+/// a literal wrapping a string_literal, or a string node.
+fn extract_string_from_node(node: Node, source: &str) -> Option<String> {
+    match node.kind() {
+        "string_literal" | "string" => {
+            let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+            Some(text.trim_matches('"').to_string())
+        }
+        "literal" => {
+            // Unwrap: literal > string_literal
+            let inner = node.named_child(0)?;
+            extract_string_from_node(inner, source)
+        }
+        _ => None,
+    }
 }
 
 /// Parse a call_expression like `String.matches(self, "pattern")`.
@@ -1042,5 +1054,48 @@ fn check() -> () = {
         assert!(i.contains(100));
         assert!(!i.contains(0));
         assert!(!i.contains(101));
+    }
+
+    #[test]
+    fn test_end_to_end_or_equality_violation() {
+        let source = r#"
+type Status = String where self == "active" || self == "inactive"
+fn check() -> () = {
+  let bad : Status = "pending"
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_baseline::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let diags = check_refinements(&tree, source, "test.bl");
+        assert!(
+            diags.iter().any(|d| d.code == "REF_002"),
+            "Expected REF_002 for invalid status, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_or_equality_valid() {
+        let source = r#"
+type Status = String where self == "active" || self == "inactive"
+fn check() -> () = {
+  let good : Status = "active"
+  let good2 : Status = "inactive"
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_baseline::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let diags = check_refinements(&tree, source, "test.bl");
+        assert!(
+            !diags.iter().any(|d| d.code == "REF_002"),
+            "Expected no REF_002 for valid status, got: {:?}",
+            diags
+        );
     }
 }

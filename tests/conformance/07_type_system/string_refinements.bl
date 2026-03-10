@@ -1,17 +1,28 @@
 @prelude(core)
 
+// check-only
 // Conformance: string refinement types
 
+// Regex pattern matching
 type Email = String where String.matches(self, "^[^@]+@[^@]+\.[^@]+$")
 
+// Length constraints
 type ShortName = String where String.length(self) >= 1 && String.length(self) <= 50
 
+// starts_with
 type HttpsUrl = String where String.starts_with(self, "https://")
+
+// Enum-style equality with ||
+type Status = String where self == "active" || self == "inactive"
 
 fn check_valid() -> () = {
   let email : Email = "user@example.com"
   let name : ShortName = "Alice"
   let url : HttpsUrl = "https://example.com"
+  let status : Status = "active"
+  let status2 : Status = "inactive"
 }
 
-test "valid string refinements" = true
+// Refined strings are subtypes of String — usable with ++
+fn greet(name: ShortName) -> String =
+  "Hello " ++ name

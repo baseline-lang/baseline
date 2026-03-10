@@ -1832,7 +1832,16 @@ fn check_node_inner(
                 }
                 "++" => {
                     // List and String concatenation
-                    match (&left_type, &right_type) {
+                    // Unwrap refined types so Refined(String, _) works with ++
+                    let left_base = match &left_type {
+                        Type::Refined(base, _) => base.as_ref(),
+                        other => other,
+                    };
+                    let right_base = match &right_type {
+                        Type::Refined(base, _) => base.as_ref(),
+                        other => other,
+                    };
+                    match (left_base, right_base) {
                         (Type::String, Type::String) => Type::String,
                         (Type::List(inner_l), Type::List(inner_r)) => {
                             if types_compatible(inner_l, inner_r) {
@@ -1846,14 +1855,14 @@ fn check_node_inner(
                         (Type::List(_), Type::Unknown)
                         | (Type::Unknown, Type::List(_))
                         | (Type::Unknown, Type::Unknown) => {
-                            if matches!(left_type, Type::List(_)) {
+                            if matches!(left_base, Type::List(_)) {
                                 left_type.clone()
                             } else {
                                 right_type.clone()
                             }
                         }
                         _ => {
-                            if left_type != Type::Unknown && right_type != Type::Unknown {
+                            if *left_base != Type::Unknown && *right_base != Type::Unknown {
                                 diagnostics.push(Diagnostic {
                                     code: "TYP_001".to_string(),
                                     severity: Severity::Error,
