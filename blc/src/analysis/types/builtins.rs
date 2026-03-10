@@ -1250,36 +1250,8 @@ pub(super) fn builtin_type_signatures(prelude: &Prelude) -> HashMap<String, Type
     }
 
     // -- Channel native methods (effect: Async) --
-    if native_modules.contains(&"Channel") {
-        sigs.insert(
-            "Channel.bounded".into(),
-            Type::Function(
-                vec![Type::Int],
-                Box::new(Type::Tuple(vec![Type::Unknown, Type::Unknown])),
-            ),
-        );
-        sigs.insert(
-            "Channel.send!".into(),
-            Type::Function(vec![Type::Unknown, Type::Unknown], Box::new(Type::Unit)),
-        );
-        sigs.insert(
-            "Channel.recv!".into(),
-            Type::Function(
-                vec![Type::Unknown],
-                Box::new(Type::Enum(
-                    "Option".into(),
-                    vec![
-                        ("Some".into(), vec![Type::Unknown]),
-                        ("None".into(), vec![]),
-                    ],
-                )),
-            ),
-        );
-        sigs.insert(
-            "Channel.close!".into(),
-            Type::Function(vec![Type::Unknown], Box::new(Type::Unit)),
-        );
-    }
+    // NOTE: Channel.bounded, Channel.send!, Channel.recv!, Channel.close!
+    // are handled via generic schemas in infer.rs for proper Tx<T>/Rx<T> type propagation.
 
     // -- Server builtins (effect: Http) --
     if builtin_modules.contains(&"Server") {

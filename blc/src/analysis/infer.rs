@@ -76,6 +76,8 @@ pub fn substitute_type_params(ty: &Type, mapping: &HashMap<String, Type>) -> Typ
         Type::Weak(inner) => Type::Weak(Box::new(substitute_type_params(inner, mapping))),
         Type::Scoped(inner) => Type::Scoped(Box::new(substitute_type_params(inner, mapping))),
         Type::Cell(inner) => Type::Cell(Box::new(substitute_type_params(inner, mapping))),
+        Type::Tx(inner) => Type::Tx(Box::new(substitute_type_params(inner, mapping))),
+        Type::Rx(inner) => Type::Rx(Box::new(substitute_type_params(inner, mapping))),
         // Concrete types pass through unchanged
         _ => ty.clone(),
     }
@@ -166,6 +168,8 @@ impl InferCtx {
             }
             (Type::Scoped(a), Type::Scoped(b)) => self.unify(a, b),
             (Type::Cell(a), Type::Cell(b)) => self.unify(a, b),
+            (Type::Tx(a), Type::Tx(b)) => self.unify(a, b),
+            (Type::Rx(a), Type::Rx(b)) => self.unify(a, b),
             (Type::Enum(na, va), Type::Enum(nb, vb)) if na == nb => {
                 // Same-named enums: unify variant payloads pairwise
                 for ((_name_a, payloads_a), (_name_b, payloads_b)) in va.iter().zip(vb.iter()) {
@@ -214,6 +218,8 @@ impl InferCtx {
             }
             Type::Scoped(inner) => Type::Scoped(Box::new(self.apply(inner))),
             Type::Cell(inner) => Type::Cell(Box::new(self.apply(inner))),
+            Type::Tx(inner) => Type::Tx(Box::new(self.apply(inner))),
+            Type::Rx(inner) => Type::Rx(Box::new(self.apply(inner))),
             Type::Weak(inner) => Type::Weak(Box::new(self.apply(inner))),
             // TypeParam passes through (only appears in templates before instantiation)
             Type::TypeParam(_) => ty.clone(),
@@ -245,6 +251,8 @@ impl InferCtx {
                 .any(|(_, payloads)| payloads.iter().any(|p| self.occurs_check(var, p))),
             Type::Scoped(inner) => self.occurs_check(var, inner),
             Type::Cell(inner) => self.occurs_check(var, inner),
+            Type::Tx(inner) => self.occurs_check(var, inner),
+            Type::Rx(inner) => self.occurs_check(var, inner),
             Type::Weak(inner) => self.occurs_check(var, inner),
             _ => false,
         }
@@ -1606,6 +1614,74 @@ pub fn builtin_generic_schemas() -> HashMap<String, GenericSchema> {
             build: |ctx| {
                 let t = ctx.fresh_var();
                 Type::Function(vec![Type::Cell(Box::new(t))], Box::new(Type::Unit))
+            },
+        },
+    );
+
+    // -- Channels: Channel.bounded, Channel.send!, Channel.recv!, Channel.close! --
+
+    // Channel.bounded : (Int) -> (Tx<T>, Rx<T>)
+    schemas.insert(
+        "Channel.bounded".into(),
+        GenericSchema {
+            type_params: 1,
+            build: |ctx| {
+                let t = ctx.fresh_var();
+                Type::Function(
+                    vec![Type::Int],
+                    Box::new(Type::Tuple(vec![
+                        Type::Tx(Box::new(t.clone())),
+                        Type::Rx(Box::new(t)),
+                    ])),
+                )
+            },
+        },
+    );
+
+    // Channel.send! : (Tx<T>, T) -> ()
+    schemas.insert(
+        "Channel.send!".into(),
+        GenericSchema {
+            type_params: 1,
+            build: |ctx| {
+                let t = ctx.fresh_var();
+                Type::Function(
+                    vec![Type::Tx(Box::new(t.clone())), t],
+                    Box::new(Type::Unit),
+                )
+            },
+        },
+    );
+
+    // Channel.recv! : (Rx<T>) -> Option<T>
+    schemas.insert(
+        "Channel.recv!".into(),
+        GenericSchema {
+            type_params: 1,
+            build: |ctx| {
+                let t = ctx.fresh_var();
+                Type::Function(
+                    vec![Type::Rx(Box::new(t.clone()))],
+                    Box::new(Type::Enum(
+                        "Option".into(),
+                        vec![
+                            ("Some".into(), vec![t]),
+                            ("None".into(), vec![]),
+                        ],
+                    )),
+                )
+            },
+        },
+    );
+
+    // Channel.close! : (Tx<T>) -> ()
+    schemas.insert(
+        "Channel.close!".into(),
+        GenericSchema {
+            type_params: 1,
+            build: |ctx| {
+                let t = ctx.fresh_var();
+                Type::Function(vec![Type::Tx(Box::new(t))], Box::new(Type::Unit))
             },
         },
     );
