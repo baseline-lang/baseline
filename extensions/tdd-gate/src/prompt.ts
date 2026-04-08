@@ -38,6 +38,17 @@ export function buildSystemPrompt(machine: PhaseStateMachine): string {
     case "RED":
       lines.push("- Write a failing test FIRST. Do not write implementation code.");
       lines.push("- Run the test to confirm it fails before moving on.");
+      // On the first cycle with no plan, prompt the agent to assess whether planning is needed
+      if (machine.cycleCount === 0 && machine.plan.length === 0) {
+        lines.push("");
+        lines.push("IMPORTANT: Before writing your first test, assess whether this task would benefit from a planning phase.");
+        lines.push("Suggest /tdd plan to the user if ANY of these apply:");
+        lines.push("  - The request is a PRD, spec, or feature with multiple acceptance criteria");
+        lines.push("  - The task touches unfamiliar or complex parts of the codebase that need investigation");
+        lines.push("  - There are industry-standard patterns or prior art worth researching first");
+        lines.push("  - The scope is ambiguous and needs decomposition into concrete test cases");
+        lines.push("If the task is well-defined (clear bug, single behavior, obvious test), skip planning and write the test directly.");
+      }
       break;
     case "GREEN":
       lines.push("- Write the MINIMUM implementation to make the failing test pass.");
