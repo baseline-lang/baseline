@@ -104,13 +104,16 @@ ${callSummaries}
 
 For EACH tool call, decide whether it is ALLOWED or BLOCKED under the current phase rules.
 
-Key guidelines:
-- In PLAN phase: ALL writes and edits are blocked. Only reading is allowed. This phase is for planning only.
-- In RED phase: only test files may be written/modified. Test files are identified by path patterns (test, spec, _test, .test, .spec) or by content that is clearly test code (assertions, test declarations).
-- In GREEN phase: implementation files may be written to make tests pass. No refactoring beyond the minimum needed.
-- In REFACTOR phase: restructuring is fine but behavior must not change. New tests are not allowed.
+Phase-specific guidelines:
+- PLAN: ALL writes and edits are blocked. Only reading is allowed.
+- RED: Only test files may be written/modified. Test files are identified by path patterns (test, spec, _test, .test, .spec) or by content that is clearly test code (assertions, test declarations).
+- GREEN: Implementation files may be written to make tests pass. Only the minimum needed — no extra features, no future-proofing, no refactoring, no abstraction beyond what the test requires.
+- REFACTOR: Restructuring is fine but behavior must not change. New tests are not allowed.
+
+General guidelines:
 - Bash commands running tests (pytest, cargo test, npm test, go test, vitest, rspec, deno test, make test, zig test, blc check) are ALWAYS allowed in any phase except PLAN.
 - Bash commands that modify files (echo >, sed -i, mv, cp, rm) follow the same rules as write/edit tools.
+- NEVER allow committing secrets, API keys, or credentials regardless of phase.
 
 Respond with a JSON array of verdicts, one per tool call, in order. No markdown fences. Example:
 [{"allowed": true, "reason": "Writing a test file during RED phase"}, {"allowed": false, "reason": "Modifying implementation file during RED phase"}]`;
