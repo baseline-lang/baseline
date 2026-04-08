@@ -1,0 +1,23 @@
+{
+  "name": "@baseline/tdd-gate",
+  "version": "0.1.0",
+  "description": "TDD enforcement gate for pi coding agent — enforces RED/GREEN/REFACTOR cycle via LLM judge",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "tdd",
+    "pi",
+    "extension",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
