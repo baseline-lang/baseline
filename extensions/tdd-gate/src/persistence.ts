@@ -10,6 +10,8 @@ export function persistState(pi: PiExtensionAPI, machine: PhaseStateMachine): vo
     phase: machine.phase,
     cycleCount: machine.cycleCount,
     lastTestFailed: machine.lastTestFailed,
+    plan: machine.plan,
+    planCompleted: machine.planCompleted,
   });
 }
 
@@ -20,7 +22,7 @@ export function persistState(pi: PiExtensionAPI, machine: PhaseStateMachine): vo
  */
 export function restoreState(
   ctx: PiContext
-): { phase: TDDPhase; cycleCount: number; lastTestFailed: boolean | null } | null {
+): { phase: TDDPhase; cycleCount: number; lastTestFailed: boolean | null; plan: string[]; planCompleted: number } | null {
   const entries = ctx.session.entries();
 
   // Walk backwards to find the most recent tdd_state entry
@@ -33,6 +35,8 @@ export function restoreState(
           phase: state.phase,
           cycleCount: state.cycleCount ?? 0,
           lastTestFailed: state.lastTestFailed ?? null,
+          plan: Array.isArray(state.plan) ? state.plan : [],
+          planCompleted: state.planCompleted ?? 0,
         };
       }
     }
@@ -42,5 +46,5 @@ export function restoreState(
 }
 
 function isValidPhase(phase: unknown): phase is TDDPhase {
-  return phase === "RED" || phase === "GREEN" || phase === "REFACTOR";
+  return phase === "PLAN" || phase === "RED" || phase === "GREEN" || phase === "REFACTOR";
 }

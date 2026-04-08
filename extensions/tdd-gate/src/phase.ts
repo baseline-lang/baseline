@@ -1,6 +1,6 @@
 import type { PhaseState, PhaseTransitionLog, TDDPhase } from "./types.js";
 
-const PHASE_ORDER: TDDPhase[] = ["RED", "GREEN", "REFACTOR"];
+const CYCLE_ORDER: TDDPhase[] = ["RED", "GREEN", "REFACTOR"];
 
 export class PhaseStateMachine {
   private state: PhaseState;
@@ -14,6 +14,8 @@ export class PhaseStateMachine {
       lastTestFailed: initial?.lastTestFailed ?? null,
       cycleCount: initial?.cycleCount ?? 0,
       enabled: initial?.enabled ?? true,
+      plan: initial?.plan ?? [],
+      planCompleted: initial?.planCompleted ?? 0,
     };
   }
 
@@ -45,8 +47,16 @@ export class PhaseStateMachine {
     return this.state.diffs;
   }
 
+  get plan(): string[] {
+    return this.state.plan;
+  }
+
+  get planCompleted(): number {
+    return this.state.planCompleted;
+  }
+
   getSnapshot(): Readonly<PhaseState> {
-    return { ...this.state, diffs: [...this.state.diffs] };
+    return { ...this.state, diffs: [...this.state.diffs], plan: [...this.state.plan] };
   }
 
   getHistory(): readonly PhaseTransitionLog[] {
@@ -81,11 +91,43 @@ export class PhaseStateMachine {
 
   /**
    * Advance to the next phase in RED -> GREEN -> REFACTOR order.
+   * PLAN phase advances to RED (starting the first cycle).
    */
   advance(reason: string): boolean {
-    const idx = PHASE_ORDER.indexOf(this.state.phase);
-    const next = PHASE_ORDER[(idx + 1) % PHASE_ORDER.length];
+    if (this.state.phase === "PLAN") {
+      return this.transitionTo("RED", reason);
+    }
+    const idx = CYCLE_ORDER.indexOf(this.state.phase);
+    const next = CYCLE_ORDER[(idx + 1) % CYCLE_ORDER.length];
     return this.transitionTo(next, reason);
+  }
+
+  /**
+   * Set the test plan (list of test case descriptions).
+   */
+  setPlan(items: string[]): void {
+    this.state.plan = items;
+    this.state.planCompleted = 0;
+  }
+
+  /**
+   * Mark the current plan item as done and advance the pointer.
+   */
+  completePlanItem(): void {
+    if (this.state.planCompleted < this.state.plan.length) {
+      this.state.planCompleted++;
+    }
+  }
+
+  /**
+   * The current plan item the agent should be working on, or null if
+   * the plan is empty or fully completed.
+   */
+  currentPlanItem(): string | null {
+    if (this.state.planCompleted < this.state.plan.length) {
+      return this.state.plan[this.state.planCompleted];
+    }
+    return null;
   }
 
   addDiff(summary: string, maxDiffs: number): void {
@@ -105,6 +147,8 @@ export class PhaseStateMachine {
    */
   allowedActions(): string {
     switch (this.state.phase) {
+      case "PLAN":
+        return "Read code. Explore the codebase. Outline test cases. Discuss the plan.";
       case "RED":
         return "Write/modify test files. Run tests to confirm failure. Read any file.";
       case "GREEN":
@@ -119,6 +163,8 @@ export class PhaseStateMachine {
    */
   prohibitedActions(): string {
     switch (this.state.phase) {
+      case "PLAN":
+        return "Write or modify any files. Run commands that change state. Only planning.";
       case "RED":
         return "Write implementation code. Modify non-test source files.";
       case "GREEN":
@@ -132,12 +178,20 @@ export class PhaseStateMachine {
    * Format a human-readable status string.
    */
   statusText(): string {
+    if (this.state.phase === "PLAN") {
+      const planCount = this.state.plan.length;
+      return `[TDD: PLAN] | Tests planned: ${planCount}`;
+    }
     const testStatus =
       this.state.lastTestFailed === null
         ? "UNKNOWN"
         : this.state.lastTestFailed
           ? "FAILING"
           : "PASSING";
-    return `[TDD: ${this.state.phase}] | Tests: ${testStatus} | Cycle: ${this.state.cycleCount}`;
+    const planProgress =
+      this.state.plan.length > 0
+        ? ` | Plan: ${this.state.planCompleted}/${this.state.plan.length}`
+        : "";
+    return `[TDD: ${this.state.phase}] | Tests: ${testStatus} | Cycle: ${this.state.cycleCount}${planProgress}`;
   }
 }

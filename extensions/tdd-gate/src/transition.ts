@@ -95,6 +95,11 @@ export async function evaluateTransition(
     machine.recordTestResult(sig.output, sig.failed);
   }
 
+  // PLAN -> RED: user-initiated only (via /tdd red)
+  if (machine.phase === "PLAN") {
+    return;
+  }
+
   // REFACTOR -> RED requires user/agent explicit signal by default
   if (machine.phase === "REFACTOR" && config.refactorTransition === "user") {
     return;

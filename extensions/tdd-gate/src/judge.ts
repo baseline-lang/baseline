@@ -14,6 +14,10 @@ import type {
 
 function phaseRules(phase: TDDPhase): string {
   switch (phase) {
+    case "PLAN":
+      return `Phase: PLAN
+ALLOWED: Reading files. Exploring the codebase. No modifications.
+BLOCKED: Writing, editing, or creating any files. Running commands that modify state.`;
     case "RED":
       return `Phase: RED
 ALLOWED: Writing or modifying test files. Running tests to confirm failure. Reading any file.
@@ -101,10 +105,11 @@ ${callSummaries}
 For EACH tool call, decide whether it is ALLOWED or BLOCKED under the current phase rules.
 
 Key guidelines:
+- In PLAN phase: ALL writes and edits are blocked. Only reading is allowed. This phase is for planning only.
 - In RED phase: only test files may be written/modified. Test files are identified by path patterns (test, spec, _test, .test, .spec) or by content that is clearly test code (assertions, test declarations).
 - In GREEN phase: implementation files may be written to make tests pass. No refactoring beyond the minimum needed.
 - In REFACTOR phase: restructuring is fine but behavior must not change. New tests are not allowed.
-- Bash commands running tests (pytest, cargo test, npm test, go test, vitest, rspec, deno test, make test, zig test, blc check) are ALWAYS allowed in any phase.
+- Bash commands running tests (pytest, cargo test, npm test, go test, vitest, rspec, deno test, make test, zig test, blc check) are ALWAYS allowed in any phase except PLAN.
 - Bash commands that modify files (echo >, sed -i, mv, cp, rm) follow the same rules as write/edit tools.
 
 Respond with a JSON array of verdicts, one per tool call, in order. No markdown fences. Example:
@@ -141,6 +146,7 @@ Current phase: ${state.phase}
 Cycle count: ${state.cycleCount}
 
 Transition rules:
+- PLAN -> RED: The agent has outlined all planned test cases and is ready to start. (Usually user-initiated via /tdd red.)
 - RED -> GREEN: A test was written and confirmed failing (test ran with failure output).
 - GREEN -> REFACTOR: The previously failing test now passes (test ran with success output).
 - REFACTOR -> RED: Refactoring is complete and tests still pass. Only transition if there is clear signal the agent is done refactoring.
@@ -218,6 +224,7 @@ function parseTransitionVerdict(raw: string): TransitionVerdict {
       const transition = parsed.transition as TDDPhase | null;
       if (
         transition === null ||
+        transition === "PLAN" ||
         transition === "RED" ||
         transition === "GREEN" ||
         transition === "REFACTOR"

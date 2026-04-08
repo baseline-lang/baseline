@@ -21,6 +21,20 @@ export function buildSystemPrompt(machine: PhaseStateMachine): string {
   ];
 
   switch (phase) {
+    case "PLAN":
+      lines.push("- You are in PLANNING mode. Read the codebase and outline test cases.");
+      lines.push("- List the tests you intend to write as a numbered plan.");
+      lines.push("- Do NOT write any code or modify any files yet.");
+      lines.push("- Once your plan is complete, the user will run /tdd red to start.");
+      if (machine.plan.length > 0) {
+        lines.push("");
+        lines.push("Current test plan:");
+        for (let i = 0; i < machine.plan.length; i++) {
+          const marker = i < machine.planCompleted ? "[x]" : "[ ]";
+          lines.push(`  ${marker} ${i + 1}. ${machine.plan[i]}`);
+        }
+      }
+      break;
     case "RED":
       lines.push("- Write a failing test FIRST. Do not write implementation code.");
       lines.push("- Run the test to confirm it fails before moving on.");
@@ -37,6 +51,15 @@ export function buildSystemPrompt(machine: PhaseStateMachine): string {
       break;
   }
 
+  // Show what test to work on next if we have a plan and we're in a cycle phase
+  if (phase !== "PLAN" && machine.plan.length > 0) {
+    const current = machine.currentPlanItem();
+    if (current) {
+      lines.push("");
+      lines.push(`Current plan item (${machine.planCompleted + 1}/${machine.plan.length}): ${current}`);
+    }
+  }
+
   lines.push("");
   lines.push(`Allowed: ${allowed}`);
   lines.push(`Prohibited: ${prohibited}`);
@@ -47,7 +70,9 @@ export function buildSystemPrompt(machine: PhaseStateMachine): string {
     lines.push(`Last test result: ${machine.lastTestFailed ? "FAILING" : "PASSING"}`);
   }
 
-  lines.push(`Cycle: ${machine.cycleCount}`);
+  if (phase !== "PLAN") {
+    lines.push(`Cycle: ${machine.cycleCount}`);
+  }
 
   return lines.join("\n");
 }

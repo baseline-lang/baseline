@@ -10,6 +10,7 @@ const DEFAULTS: TDDConfig = {
   temperature: 0,
   maxDiffsInContext: 5,
   persistPhase: true,
+  startInPlanMode: false,
 };
 
 export function loadConfig(pi: PiExtensionAPI): TDDConfig {

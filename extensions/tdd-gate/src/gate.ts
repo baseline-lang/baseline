@@ -84,6 +84,25 @@ export async function gateToolCalls(
     return calls.map(() => undefined);
   }
 
+  // PLAN phase: deterministic block on all writes — no judge needed
+  if (machine.phase === "PLAN") {
+    const results: (ToolCallResult | undefined)[] = calls.map(() => undefined);
+    for (const idx of gatedIndices) {
+      const call = calls[idx];
+      ctx.ui.notify(
+        `Blocked: ${call.tool_name} during PLAN phase. Finish your test plan first.`,
+        "warning"
+      );
+      const override = await ctx.ui.confirm(
+        `PLAN phase blocks all writes. Override and allow ${call.tool_name}?`
+      );
+      if (!override) {
+        results[idx] = { block: true, reason: "PLAN phase: no file modifications allowed. Outline your tests first, then /tdd red to start." };
+      }
+    }
+    return results;
+  }
+
   // Ask the LLM judge
   let verdicts;
   try {

@@ -26,8 +26,9 @@ export default function activate(pi: PiExtensionAPI): void {
   const config = loadConfig(pi);
   if (!config.enabled) return;
 
-  // Initialize phase state machine (restored from session or defaults to RED)
-  const machine = new PhaseStateMachine();
+  // Initialize phase state machine — defaults to PLAN if configured, else RED
+  const initialPhase = config.startInPlanMode ? "PLAN" : "RED";
+  const machine = new PhaseStateMachine({ phase: initialPhase });
 
   // Lazily create the judge session on first use
   let judgeSession: AgentSession | null = null;
@@ -51,6 +52,12 @@ export default function activate(pi: PiExtensionAPI): void {
         machine.transitionTo(saved.phase, "Restored from session", false);
         if (saved.lastTestFailed !== null) {
           machine.recordTestResult("(restored)", saved.lastTestFailed);
+        }
+        if (saved.plan.length > 0) {
+          machine.setPlan(saved.plan);
+          for (let i = 0; i < saved.planCompleted; i++) {
+            machine.completePlanItem();
+          }
         }
       }
     }

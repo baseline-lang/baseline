@@ -2,7 +2,7 @@
 // TDD Gate types
 // ---------------------------------------------------------------------------
 
-export type TDDPhase = "RED" | "GREEN" | "REFACTOR";
+export type TDDPhase = "PLAN" | "RED" | "GREEN" | "REFACTOR";
 
 export interface PhaseState {
   phase: TDDPhase;
@@ -11,6 +11,8 @@ export interface PhaseState {
   lastTestFailed: boolean | null;
   cycleCount: number;
   enabled: boolean;
+  plan: string[];
+  planCompleted: number;
 }
 
 export interface PhaseTransitionLog {
@@ -31,6 +33,7 @@ export interface TDDConfig {
   temperature: number;
   maxDiffsInContext: number;
   persistPhase: boolean;
+  startInPlanMode: boolean;
 }
 
 export interface JudgeVerdict {
@@ -48,6 +51,8 @@ export interface TDDStateEntry {
   phase: TDDPhase;
   cycleCount: number;
   lastTestFailed: boolean | null;
+  plan: string[];
+  planCompleted: number;
 }
 
 // ---------------------------------------------------------------------------

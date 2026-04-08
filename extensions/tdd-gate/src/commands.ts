@@ -1,7 +1,7 @@
 import type { PiContext, TDDPhase } from "./types.js";
 import type { PhaseStateMachine } from "./phase.js";
 
-const VALID_PHASES: TDDPhase[] = ["RED", "GREEN", "REFACTOR"];
+const VALID_PHASES: TDDPhase[] = ["PLAN", "RED", "GREEN", "REFACTOR"];
 
 /**
  * Handle the /tdd command. Returns a message to display to the user.
@@ -17,12 +17,17 @@ export async function handleTddCommand(
     case "status":
       return formatStatus(machine);
 
+    case "plan":
     case "red":
     case "green":
     case "refactor": {
       const target = sub.toUpperCase() as TDDPhase;
       if (!VALID_PHASES.includes(target)) {
-        return `Unknown phase: ${sub}. Valid phases: RED, GREEN, REFACTOR.`;
+        return `Unknown phase: ${sub}. Valid phases: ${VALID_PHASES.join(", ")}.`;
+      }
+      // When transitioning from REFACTOR to RED with a plan, advance the plan pointer
+      if (machine.phase === "REFACTOR" && target === "RED" && machine.plan.length > 0) {
+        machine.completePlanItem();
       }
       const ok = machine.transitionTo(target, "User forced via /tdd command", true);
       if (ok) {
@@ -31,6 +36,29 @@ export async function handleTddCommand(
         return `Phase set to ${target}.`;
       }
       return `Already in ${target} phase.`;
+    }
+
+    case "plan-set": {
+      // /tdd plan-set "Test 1" "Test 2" "Test 3"
+      const items = args.slice(1).filter(Boolean);
+      if (items.length === 0) {
+        return "Usage: /tdd plan-set \"Test case 1\" \"Test case 2\" ...";
+      }
+      machine.setPlan(items);
+      ctx.ui.notify(`Test plan set with ${items.length} item(s)`, "success");
+      return formatPlan(machine);
+    }
+
+    case "plan-show":
+      return formatPlan(machine);
+
+    case "plan-done": {
+      machine.completePlanItem();
+      const next = machine.currentPlanItem();
+      if (next) {
+        return `Plan item completed. Next: ${next} (${machine.planCompleted}/${machine.plan.length})`;
+      }
+      return `All ${machine.plan.length} plan items completed!`;
     }
 
     case "off":
@@ -68,6 +96,22 @@ function formatStatus(machine: PhaseStateMachine): string {
     `Test state: ${snap.lastTestFailed === null ? "unknown" : snap.lastTestFailed ? "failing" : "passing"}`,
     `Diffs:      ${snap.diffs.length} accumulated`,
   ];
+  if (snap.plan.length > 0) {
+    lines.push(`Plan:       ${snap.planCompleted}/${snap.plan.length} completed`);
+  }
+  return lines.join("\n");
+}
+
+function formatPlan(machine: PhaseStateMachine): string {
+  const snap = machine.getSnapshot();
+  if (snap.plan.length === 0) {
+    return "No test plan set. Use /tdd plan-set \"Test 1\" \"Test 2\" ... to create one.";
+  }
+  const lines = [`Test plan (${snap.planCompleted}/${snap.plan.length} completed):`, ""];
+  for (let i = 0; i < snap.plan.length; i++) {
+    const marker = i < snap.planCompleted ? "[x]" : i === snap.planCompleted ? "[>]" : "[ ]";
+    lines.push(`  ${marker} ${i + 1}. ${snap.plan[i]}`);
+  }
   return lines.join("\n");
 }
 
@@ -90,9 +134,13 @@ const HELP_TEXT = `Usage: /tdd [subcommand]
 
   /tdd              Show current phase and status
   /tdd status       Same as above
+  /tdd plan         Enter PLAN phase (read-only, outline tests)
   /tdd red          Force transition to RED phase
   /tdd green        Force transition to GREEN phase
   /tdd refactor     Force transition to REFACTOR phase
+  /tdd plan-set     Set test plan: /tdd plan-set "Test 1" "Test 2" ...
+  /tdd plan-show    Show the current test plan with progress
+  /tdd plan-done    Mark current plan item as completed
   /tdd off          Disable TDD enforcement
   /tdd on           Re-enable TDD enforcement
   /tdd history      Show phase transition log`;
