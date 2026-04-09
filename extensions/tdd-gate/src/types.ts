@@ -34,6 +34,21 @@ export interface TDDConfig {
   maxDiffsInContext: number;
   persistPhase: boolean;
   startInPlanMode: boolean;
+  guidelines: GuidelinesConfig;
+}
+
+/**
+ * Per-phase coding guidelines. Each key is a string injected into the
+ * system prompt during that phase. Set a key to null to suppress the
+ * default for that category. Set to a custom string to override.
+ */
+export interface GuidelinesConfig {
+  plan: string | null;
+  red: string | null;
+  green: string | null;
+  refactor: string | null;
+  universal: string | null;
+  security: string | null;
 }
 
 export interface JudgeVerdict {

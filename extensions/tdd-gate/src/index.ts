@@ -68,7 +68,7 @@ export default function activate(pi: PiExtensionAPI): void {
   // before_agent_start — inject TDD phase into system prompt
   // ---------------------------------------------------------
   pi.on("before_agent_start", (_ctx: PiContext) => {
-    return { systemMessage: buildSystemPrompt(machine) };
+    return { systemMessage: buildSystemPrompt(machine, config) };
   });
 
   // ---------------------------------------------------------
@@ -112,5 +112,6 @@ export { gateSingleToolCall, gateToolCalls } from "./gate.js";
 export { evaluateTransition, extractTestSignals } from "./transition.js";
 export { buildSystemPrompt } from "./prompt.js";
 export { handleTddCommand } from "./commands.js";
+export { guidelinesForPhase, resolveGuidelines, DEFAULTS as GUIDELINE_DEFAULTS } from "./guidelines.js";
 export { persistState, restoreState } from "./persistence.js";
 export type * from "./types.js";

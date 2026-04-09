@@ -1,6 +1,7 @@
-import type { TDDConfig, PiExtensionAPI } from "./types.js";
+import type { TDDConfig, PiExtensionAPI, GuidelinesConfig } from "./types.js";
+import { resolveGuidelines } from "./guidelines.js";
 
-const DEFAULTS: TDDConfig = {
+const DEFAULTS: Omit<TDDConfig, "guidelines"> = {
   enabled: true,
   judgeModel: "haiku",
   judgeProvider: "anthropic",
@@ -14,7 +15,9 @@ const DEFAULTS: TDDConfig = {
 };
 
 export function loadConfig(pi: PiExtensionAPI): TDDConfig {
-  const user = pi.getSettings<Partial<TDDConfig>>("tddGate");
-  if (!user) return { ...DEFAULTS };
-  return { ...DEFAULTS, ...user };
+  const user = pi.getSettings<Partial<TDDConfig> & { guidelines?: Partial<GuidelinesConfig> }>("tddGate");
+  const guidelines = resolveGuidelines(user?.guidelines);
+  if (!user) return { ...DEFAULTS, guidelines };
+  const { guidelines: _, ...rest } = user;
+  return { ...DEFAULTS, ...rest, guidelines };
 }
